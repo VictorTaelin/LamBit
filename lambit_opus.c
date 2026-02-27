@@ -137,6 +137,7 @@ static void free_term(uint16_t p) {
 static uint8_t code[MAX_CODE];
 static uint32_t code_len = 0;
 
+
 // ---- Stats ----
 static uint64_t stat_fun = 0;
 static uint64_t stat_lam = 0;
@@ -494,7 +495,7 @@ static uint32_t feed_term(uint32_t pc, uint16_t term) {
 // ---- Evaluator ----
 // Goto dispatch, packed u32 conts, TUP(d=1) fusion, deforestation.
 
-static uint16_t __attribute__((hot, flatten)) eval_iterative(uint32_t start_pc) {
+static uint16_t __attribute__((hot)) eval_iterative(uint32_t start_pc) {
   uint32_t pc  = start_pc;
   uint16_t val = 0;
   uint32_t saved_sp;
