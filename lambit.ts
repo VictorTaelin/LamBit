@@ -1,12 +1,12 @@
-// LamBit.ts
+;j// LamBit.ts
 // =========
 // A minimal functional language based on binary pattern-matching case-trees.
 //
 //     Func ::=
-//       | Get ::= "!" Func
-//       | Mat ::= "λ" "{" "0" ":" Func ";" "1" ":" Func ";" "}"
 //       | Lam ::= "λ" Name "." Func
+//       | Mat ::= "λ" "{" "0" ":" Func ";" "1" ":" Func ";" "}"
 //       | Use ::= "λ" "()" "." Func
+//       | Get ::= "λ" "!" Func
 //       | Ret ::= Term
 //
 //     Term ::=
@@ -30,12 +30,12 @@
 // 
 // It can be expressed on LamBit as:
 //
-//     F = ! λ{
-//       0: ! λ{ // computes addition
+//     F = λ! λ{
+//       0: λ! λ{ // computes addition
 //         0: λ(). b
 //         1: λa. λb. (1,~(0,(a,b)))
 //       }
-//       1: ! λ{ // computes multiplication
+//       1: λ! λ{ // computes multiplication
 //         0: λb. 0{}
 //         1: λa. λb. ~(0,(b,~(1,(a,b))))
 //       }
@@ -166,7 +166,7 @@ function is_tup(p: Parser): boolean {
 function parse_func(p: Parser, ctx: Map<string, Term>): Func {
   skip(p);
   // Get: ! Func
-  if (match(p, "!")) {
+  if (match(p, "λ!")) {
     var fun = parse_func(p, ctx);
     return Get(fun);
   }
@@ -366,7 +366,7 @@ function show_func(func: Func, dep: number = 0): string {
   switch (func.$) {
     case "Get": {
       var fun = show_func(func.fun, dep);
-      return `! ${fun}`;
+      return `λ! ${fun}`;
     }
     case "Mat": {
       var zro = show_func(func.zro, dep);
@@ -405,75 +405,38 @@ function show_stats(stats: Stats): string {
 // Test
 // ----
 
-// Decrements 65535 til it hits 0.
-// 
-// Bits ::=
-// | []     ::= (0,())
-// | 0 : xs ::= (1,(0,xs))
-// | 1 : xs ::= (1,(1,xs))
-// 
-// Bool ::=
-// | False ::= 0
-// | True  ::= 1
-//
-// main x        = cond (is0 x) x
-// is0 []        = True
-// is0 (0 : xs)  = is0 xs
-// is0 (1 : xs)  = False
-// dec []        = []
-// dec (0 : xs)  = 1 : dec xs
-// dec (1 : xs)  = 0 : xs
-// cond False x  = main (dec x)
-// cond True  x  = []
-
+// main x          = try (dec x)
+// try []       zs = zs
+// try (0 : xs) zs = try xs (0 : zs)
+// try (1 : xs) zs = main (cat zs (1 : xs))
+// cat []       ys = ys
+// cat (x : xs) ys = x : (cat xs ys)
+// dec []          = []
+// dec (0 : xs)    = 1 : dec xs
+// dec (1 : xs)    = 0 : xs
 function test() {
-  // F = ! λ{
-  //   0: ! λ{
-  //     0: λx. ~(1,(1,(~(0,(1,x)),x)))       // main x = cond (is0 x) x
-  //     1: ! λ{                               // is0:
-  //       0: λ(). 1                            //   is0 [] = True
-  //       1: ! λ{                              //   is0 (b:xs):
-  //         0: λxs. ~(0,(1,xs))                //     is0 (0:xs) = is0 xs
-  //         1: λxs. 0                          //     is0 (1:xs) = False
-  //       }
-  //     }
-  //   }
-  //   1: ! λ{
-  //     0: ! λ{                               // dec:
-  //       0: λ(). (0,())                       //   dec [] = []
-  //       1: ! λ{                              //   dec (b:xs):
-  //         0: λxs. (1,(1,~(1,(0,xs))))        //     dec (0:xs) = 1 : dec xs
-  //         1: λxs. (1,(0,xs))                 //     dec (1:xs) = 0 : xs
-  //       }
-  //     }
-  //     1: ! λ{                               // cond:
-  //       0: λx. ~(0,(0,~(1,(0,x))))           //   cond False x = main (dec x)
-  //       1: λx. (0,())                        //   cond True  x = []
-  //     }
-  //   }
-  // }
-  var prog_src = `! λ{
-    0: ! λ{
-      0: λx. ~(1,(1,(~(0,(1,x)),x)))
-      1: ! λ{
-        0: λ(). 1
-        1: ! λ{
-          0: λxs. ~(0,(1,xs))
-          1: λxs. 0
+  var prog_src = `λ! λ{
+    0: λ! λ{
+      0: λx. ~(0,(1,(~(1,(1,x)),(0,()))))
+      1: λ! λ! λ{
+        0: λ(). λzs. zs
+        1: λ! λ{
+          0: λxs. λzs. ~(0,(1,(xs,(1,(0,zs)))))
+          1: λxs. λzs. ~(0,(0,~(1,(0,(zs,(1,(1,xs)))))))
         }
       }
     }
-    1: ! λ{
-      0: ! λ{
+    1: λ! λ{
+      0: λ! λ! λ{
+        0: λ(). λys. ys
+        1: λ! λx. λxs. λys. (1,(x,~(1,(0,(xs,ys)))))
+      }
+      1: λ! λ{
         0: λ(). (0,())
-        1: ! λ{
-          0: λxs. (1,(1,~(1,(0,xs))))
+        1: λ! λ{
+          0: λxs. (1,(1,~(1,(1,xs))))
           1: λxs. (1,(0,xs))
         }
-      }
-      1: ! λ{
-        0: λx. ~(0,(0,~(1,(0,x))))
-        1: λx. (0,())
       }
     }
   }`;
@@ -483,12 +446,12 @@ function test() {
   var prog = parse_func(pp, new Map());
   console.log("prog:", show_func(prog));
 
-  // Build 65535 as 16 one-bits (LSB-first): (1,(1,(1,(1,...(1,(1,(0,())))...))))
+  // Build n as 20 one-bits (LSB-first): (1,(1,...(1,(1,(0,()))))) = 2^20 - 1 = 1048575
   var n = "(0,())";
   for (var i = 0; i < 20; i++) {
     n = "(1,(1," + n + "))";
   }
-  // Call: ~(0,(0,<65535>)) = main(65535)
+  // Call: ~(0,(0,<n>)) = main(n)
   var input_src = "~(0,(0," + n + "))";
   var input     = parse_term({src: input_src, idx: 0}, new Map());
 
@@ -503,40 +466,3 @@ function test() {
 }
 
 test();
-
-// That works very well - good job!
-// Sadly, the TS interpreter is too slow. The term above returns:
-// (0,())
-// Interactions: 56622872
-// - APP-FUN: 6291433
-// - APP-LAM: 6291432
-// - APP-MAT: 22020003
-// - APP-GET: 22020003
-// - APP-USE: 1
-// In 5 seconds. That means it achieves only about ~11m interactions/s. 
-
-// Now, your goal is to extend LamBit with a fast, memory-efficient C compiler.
-// To achieve that, we will represent memory using U16 Ptrs, where:
-// Ptr ::= Ctr | Loc
-// Ctr ::= NUL | TUP | BT0 | BT1
-// Loc ::= 14-bit address
-// The top-level program will be *fully compiled* to a single, efficient, native
-// C function. That means we don't need to implement VAR or REC as Term
-// variants, since these are just part of the compiled C function, and not valid
-// as runtime terms. We also need to implement a very fast allocator and
-// ref-counted garbage collector.  The allocator will be dead simple: it will
-// just be a bump allocator that wraps around the complete heap (which is a
-// buffer with 2^14 u16 Terms) seeking an empty slot (==0). The garbage
-// collector will simply free() a Term and its children recursively when its
-// ref-count goes to 0. The ref-count of a reference decreases when it is passed
-// to a lambda that doesn't use it on the returned Term.
-// The C compiler will receive a LamBit program as its input, and output a C
-// program that applies it to an input, and prints the result, including stats,
-// as fast as possible. Example usage:
-// $ lambit main.lb -o main
-// $ ./main "~(0,(0,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(0,())))))))))))))))))))))))))))))))))))))))))))"
-// should output exactly the same as test() above, but in *much* less time.
-// Your ultimate goal is to:
-// - implement the compiler correctly
-// - make it as fast as you can
-// Start working on this now.
