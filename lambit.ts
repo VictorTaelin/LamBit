@@ -3,13 +3,18 @@
 // A minimal functional language based on binary pattern-matching case-trees.
 //
 //     Func ::=
+//       | Get ::= "!" Func
 //       | Mat ::= "λ" "{" "0" ":" Func ";" "1" ":" Func ";" "}"
 //       | Lam ::= "λ" Name "." Func
+//       | Use ::= "λ" "()" "." Func
 //       | Ret ::= Term
 //
 //     Term ::=
 //       | Var ::= Name
-//       | Ctr ::= ("0" | "1") "{" [Term ","?] "}"
+//       | Bt0 ::= "0"
+//       | Bt1 ::= "1"
+//       | Nul ::= "()"
+//       | Tup ::= "(" Term "," Term ")"
 //       | Rec ::= "~" Term
 //
 // LamBit programs are composed by a single "top-level" function. Computation
@@ -25,66 +30,76 @@
 // 
 // It can be expressed on LamBit as:
 //
-//     F = λ{
-//       0: λ{ // computes addition
-//         0: λb. b
-//         1: λa. λb. 1{~0{a,b}}
+//     F = ! λ{
+//       0: ! λ{ // computes addition
+//         0: λ(). b
+//         1: λa. λb. (1,~(0,(a,b)))
 //       }
-//       1: λ{ // computes multiplication
+//       1: ! λ{ // computes multiplication
 //         0: λb. 0{}
-//         1: λa. λb. ~0{b,~1{a,b}}
+//         1: λa. λb. ~(0,(b,~(1,(a,b))))
 //       }
 //     }
 //
 // Where natural numbers are encoded as:
 //
 //     Nat ::=
-//     | zero ::= 0{}
-//     | succ ::= 1{Nat}
-//     (aliasing 0n as 0{}, 1n as 1{0{}}, 2n as 1{1{0{}}}, etc.)
+//     | zero ::= (0,())
+//     | succ ::= (1,Nat)
+//     (aliasing 3n as (1,(1,(1,(0,())))), and so on)
 //
-// For instance, ~1{2n,3n} evaluates 2n*3n to 6n:
+// For instance, ~(1,(2n,3n)) evaluates 2n*3n to 6n:
 //
-//     ~1{2n,3n}
-//     = ~0{3n, ~1{1n,3n}}
-//     = ~0{3n, ~0{3n, ~1{0n,3n}}}
-//     = ~0{3n, ~0{3n, 0n}}
-//     = ~0{3n, 3n}
-//     = 1{~0{2n,3n}}
-//     = 1{1{~0{1n,3n}}}
-//     = 1{1{1{~0{0n,3n}}}}
-//     = 1{1{1{3n}}}
+//     ~(1,(2n,3n))
+//     = ~(0,(3n, ~(1,(1n,3n))))
+//     = ~(0,(3n, ~(0,(3n, ~(1,((0,()),3n))))))
+//     = ~(0,(3n, ~(0,(3n, (0,())))))
+//     = ~(0,(3n, 3n))
+//     = (1,~(0,(2n,3n)))
+//     = (1,(1,~(0,(1n,3n))))
+//     = (1,(1,(1,~(0,((0,()),3n)))))
+//     = (1,(1,(1,3n)))
 //     = 6n
 
 // Types
 // -----
 
 // Function-side: patterns and lambdas
+type Get  = { $: "Get", fun: Func };
 type Mat  = { $: "Mat", zro: Func, one: Func };
 type Lam  = { $: "Lam", nam: string, bod: (x: Term) => Func };
+type Use  = { $: "Use", bod: Func };
 type Ret  = { $: "Ret", trm: Term };
-type Func = Mat | Lam | Ret;
+type Func = Get | Mat | Lam | Use | Ret;
 
 // Data-side: values and expressions
 type Var  = { $: "Var", nam: string };
-type Ctr  = { $: "Ctr", tag: number, fds: Term[] };
+type Bt0  = { $: "Bt0" };
+type Bt1  = { $: "Bt1" };
+type Nul  = { $: "Nul" };
+type Tup  = { $: "Tup", fst: Term, snd: Term };
 type Rec  = { $: "Rec", arg: Term };
-type Term = Var | Ctr | Rec;
+type Term = Var | Bt0 | Bt1 | Nul | Tup | Rec;
 
 // Interaction stats
-type Stats = { app_fun: number, app_lam: number, app_mat: number };
+type Stats = { app_fun: number, app_lam: number, app_mat: number, app_get: number, app_use: number };
 
 // Constructors
+const Get = (fun)      => ({ $: "Get", fun }) as Func;
 const Mat = (zro, one) => ({ $: "Mat", zro, one }) as Func;
 const Lam = (nam, bod) => ({ $: "Lam", nam, bod }) as Func;
+const Use = (bod)      => ({ $: "Use", bod }) as Func;
 const Ret = (trm)      => ({ $: "Ret", trm }) as Func;
 const Var = (nam)      => ({ $: "Var", nam }) as Term;
-const Ctr = (tag, fds) => ({ $: "Ctr", tag, fds }) as Term;
+const Bt0 = ()         => ({ $: "Bt0" }) as Term;
+const Bt1 = ()         => ({ $: "Bt1" }) as Term;
+const Nul = ()         => ({ $: "Nul" }) as Term;
+const Tup = (fst, snd) => ({ $: "Tup", fst, snd }) as Term;
 const Rec = (arg)      => ({ $: "Rec", arg }) as Term;
 
 // Creates a fresh stats counter
 function new_stats(): Stats {
-  return { app_fun: 0, app_lam: 0, app_mat: 0 };
+  return { app_fun: 0, app_lam: 0, app_mat: 0, app_get: 0, app_use: 0 };
 }
 
 // Parser
@@ -135,17 +150,27 @@ function parse_name(p: Parser): string {
   return p.src.slice(start, p.idx);
 }
 
-// Checks if a tag digit is followed by '{'
-function is_ctr(p: Parser): boolean {
+// Checks if current position is "()" (null literal)
+function is_nul(p: Parser): boolean {
   skip(p);
-  var c = p.src[p.idx];
-  return (c === "0" || c === "1") && p.src[p.idx + 1] === "{";
+  return p.src[p.idx] === "(" && p.src[p.idx + 1] === ")";
+}
+
+// Checks if current position starts a tuple: "(" but not "()"
+function is_tup(p: Parser): boolean {
+  skip(p);
+  return p.src[p.idx] === "(" && p.src[p.idx + 1] !== ")";
 }
 
 // Parses a Func with a name context for HOAS
 function parse_func(p: Parser, ctx: Map<string, Term>): Func {
   skip(p);
-  // Mat or Lam
+  // Get: ! Func
+  if (match(p, "!")) {
+    var fun = parse_func(p, ctx);
+    return Get(fun);
+  }
+  // Mat or Lam or Use
   if (match(p, "λ")) {
     // Mat: λ{ 0: ... 1: ... }
     if (match(p, "{")) {
@@ -159,6 +184,12 @@ function parse_func(p: Parser, ctx: Map<string, Term>): Func {
       match(p, ";");
       expect(p, "}");
       return Mat(zro, one);
+    }
+    // Use: λ(). Func
+    if (match(p, "()")) {
+      expect(p, ".");
+      var bod = parse_func(p, ctx);
+      return Use(bod);
     }
     // Lam: λName. Func
     var nam = parse_name(p);
@@ -196,19 +227,29 @@ function parse_term(p: Parser, ctx: Map<string, Term>): Term {
     var arg = parse_term(p, ctx);
     return Rec(arg);
   }
-  // Ctr: 0{...} or 1{...}
-  if (is_ctr(p)) {
-    var tag = p.src[p.idx] === "0" ? 0 : 1;
+  // Nul: ()
+  if (is_nul(p)) {
+    match(p, "()");
+    return Nul();
+  }
+  // Tup: (Term, Term)
+  if (is_tup(p)) {
+    match(p, "(");
+    var fst = parse_term(p, ctx);
+    expect(p, ",");
+    var snd = parse_term(p, ctx);
+    expect(p, ")");
+    return Tup(fst, snd);
+  }
+  // Bt0: 0
+  if (peek(p) === "0" && !/[a-zA-Z_0-9{]/.test(p.src[p.idx + 1] || "")) {
     p.idx++;
-    expect(p, "{");
-    var fds: Term[] = [];
-    while (!match(p, "}")) {
-      if (fds.length > 0) {
-        match(p, ",");
-      }
-      fds.push(parse_term(p, ctx));
-    }
-    return Ctr(tag, fds);
+    return Bt0();
+  }
+  // Bt1: 1
+  if (peek(p) === "1" && !/[a-zA-Z_0-9{]/.test(p.src[p.idx + 1] || "")) {
+    p.idx++;
+    return Bt1();
   }
   // Var: Name
   var nam = parse_name(p);
@@ -222,24 +263,35 @@ function parse_term(p: Parser, ctx: Map<string, Term>): Term {
 // Evaluation
 // ----------
 
-// Feeds a single term into a Func (handles Lam and Mat)
+// Feeds a single term into a Func (handles Get, Mat, Lam, Use)
 function feed(prog: Func, func: Func, term: Term, stats: Stats): Func {
   switch (func.$) {
+    case "Get": {
+      if (term.$ !== "Tup") {
+        throw new Error("Get expected a Tup");
+      }
+      stats.app_get++;
+      var result = feed(prog, func.fun, term.fst, stats);
+      result = feed(prog, result, term.snd, stats);
+      return result;
+    }
     case "Lam": {
       stats.app_lam++;
       return func.bod(term);
     }
     case "Mat": {
-      if (term.$ !== "Ctr") {
-        throw new Error("Mat expected a Ctr");
+      if (term.$ !== "Bt0" && term.$ !== "Bt1") {
+        throw new Error("Mat expected a Bt0 or Bt1");
       }
       stats.app_mat++;
-      var branch = term.tag === 0 ? func.zro : func.one;
-      var result = branch as Func;
-      for (var i = 0; i < term.fds.length; i++) {
-        result = feed(prog, result, term.fds[i], stats);
+      return term.$ === "Bt0" ? func.zro : func.one;
+    }
+    case "Use": {
+      if (term.$ !== "Nul") {
+        throw new Error("Use expected a Nul");
       }
-      return result;
+      stats.app_use++;
+      return func.bod;
     }
     default: {
       throw new Error("Cannot feed into a Ret");
@@ -253,9 +305,19 @@ function eval_term(prog: Func, term: Term, stats: Stats): Term {
     case "Var": {
       return term;
     }
-    case "Ctr": {
-      var fds = term.fds.map(fd => eval_term(prog, fd, stats));
-      return Ctr(term.tag, fds);
+    case "Bt0": {
+      return term;
+    }
+    case "Bt1": {
+      return term;
+    }
+    case "Nul": {
+      return term;
+    }
+    case "Tup": {
+      var fst = eval_term(prog, term.fst, stats);
+      var snd = eval_term(prog, term.snd, stats);
+      return Tup(fst, snd);
     }
     case "Rec": {
       stats.app_fun++;
@@ -278,9 +340,19 @@ function show_term(term: Term): string {
     case "Var": {
       return term.nam;
     }
-    case "Ctr": {
-      var fds = term.fds.map(show_term).join(",");
-      return `${term.tag}{${fds}}`;
+    case "Bt0": {
+      return "0";
+    }
+    case "Bt1": {
+      return "1";
+    }
+    case "Nul": {
+      return "()";
+    }
+    case "Tup": {
+      var fst = show_term(term.fst);
+      var snd = show_term(term.snd);
+      return `(${fst},${snd})`;
     }
     case "Rec": {
       var arg = show_term(term.arg);
@@ -292,6 +364,10 @@ function show_term(term: Term): string {
 // Converts a func to a string
 function show_func(func: Func, dep: number = 0): string {
   switch (func.$) {
+    case "Get": {
+      var fun = show_func(func.fun, dep);
+      return `! ${fun}`;
+    }
     case "Mat": {
       var zro = show_func(func.zro, dep);
       var one = show_func(func.one, dep);
@@ -302,6 +378,10 @@ function show_func(func: Func, dep: number = 0): string {
       var bod = show_func(func.bod(Var(nam)), dep + 1);
       return `λ${nam}. ${bod}`;
     }
+    case "Use": {
+      var bod = show_func(func.bod, dep);
+      return `λ(). ${bod}`;
+    }
     case "Ret": {
       return show_term(func.trm);
     }
@@ -310,12 +390,14 @@ function show_func(func: Func, dep: number = 0): string {
 
 // Formats stats as a report string
 function show_stats(stats: Stats): string {
-  var total = stats.app_fun + stats.app_lam + stats.app_mat;
+  var total = stats.app_fun + stats.app_lam + stats.app_mat + stats.app_get + stats.app_use;
   var lines = [
     `Interactions: ${total}`,
     `- APP-FUN: ${stats.app_fun}`,
     `- APP-LAM: ${stats.app_lam}`,
     `- APP-MAT: ${stats.app_mat}`,
+    `- APP-GET: ${stats.app_get}`,
+    `- APP-USE: ${stats.app_use}`,
   ];
   return lines.join("\n");
 }
@@ -326,13 +408,13 @@ function show_stats(stats: Stats): string {
 // Decrements 65535 til it hits 0.
 // 
 // Bits ::=
-// | []   ::= 0{}
-// | 0,xs ::= 1{0{xs}}
-// | 1,xs ::= 1{1{xs}}
+// | []     ::= (0,())
+// | 0 : xs ::= (1,(0,xs))
+// | 1 : xs ::= (1,(1,xs))
 // 
 // Bool ::=
-// | False ::= 0{}
-// | True  ::= 1{}
+// | False ::= 0
+// | True  ::= 1
 //
 // main x        = cond (is0 x) x
 // is0 []        = True
@@ -344,29 +426,54 @@ function show_stats(stats: Stats): string {
 // cond False x  = main (dec x)
 // cond True  x  = []
 
-function main() {
-  var prog_src = `λ{
-    0: λ{
-      0: λx. ~1{1{~0{1{x}},x}}
-      1: λ{
-        0: 1{}
-        1: λ{
-          0: λxs. ~0{1{xs}}
-          1: λxs. 0{}
+function test() {
+  // F = ! λ{
+  //   0: ! λ{
+  //     0: λx. ~(1,(1,(~(0,(1,x)),x)))       // main x = cond (is0 x) x
+  //     1: ! λ{                               // is0:
+  //       0: λ(). 1                            //   is0 [] = True
+  //       1: ! λ{                              //   is0 (b:xs):
+  //         0: λxs. ~(0,(1,xs))                //     is0 (0:xs) = is0 xs
+  //         1: λxs. 0                          //     is0 (1:xs) = False
+  //       }
+  //     }
+  //   }
+  //   1: ! λ{
+  //     0: ! λ{                               // dec:
+  //       0: λ(). (0,())                       //   dec [] = []
+  //       1: ! λ{                              //   dec (b:xs):
+  //         0: λxs. (1,(1,~(1,(0,xs))))        //     dec (0:xs) = 1 : dec xs
+  //         1: λxs. (1,(0,xs))                 //     dec (1:xs) = 0 : xs
+  //       }
+  //     }
+  //     1: ! λ{                               // cond:
+  //       0: λx. ~(0,(0,~(1,(0,x))))           //   cond False x = main (dec x)
+  //       1: λx. (0,())                        //   cond True  x = []
+  //     }
+  //   }
+  // }
+  var prog_src = `! λ{
+    0: ! λ{
+      0: λx. ~(1,(1,(~(0,(1,x)),x)))
+      1: ! λ{
+        0: λ(). 1
+        1: ! λ{
+          0: λxs. ~(0,(1,xs))
+          1: λxs. 0
         }
       }
     }
-    1: λ{
-      0: λ{
-        0: 0{}
-        1: λ{
-          0: λxs. 1{1{~1{0{xs}}}}
-          1: λxs. 1{0{xs}}
+    1: ! λ{
+      0: ! λ{
+        0: λ(). (0,())
+        1: ! λ{
+          0: λxs. (1,(1,~(1,(0,xs))))
+          1: λxs. (1,(0,xs))
         }
       }
-      1: λ{
-        0: λx. ~0{0{~1{0{x}}}}
-        1: λx. 0{}
+      1: ! λ{
+        0: λx. ~(0,(0,~(1,(0,x))))
+        1: λx. (0,())
       }
     }
   }`;
@@ -376,26 +483,60 @@ function main() {
   var prog = parse_func(pp, new Map());
   console.log("prog:", show_func(prog));
 
-  // Build 65535 as 16 one-bits (LSB-first): 1{1{1{1{...1{1{0{}}}...}}}}
-  var n = "0{}";
-  for (var i = 0; i < 16; i++) {
-    n = "1{1{" + n + "}}";
+  // Build 65535 as 16 one-bits (LSB-first): (1,(1,(1,(1,...(1,(1,(0,())))...))))
+  var n = "(0,())";
+  for (var i = 0; i < 20; i++) {
+    n = "(1,(1," + n + "))";
   }
-  // Call: ~0{0{<65535>}} = main(65535)
-  var input_src = "~0{0{" + n + "}}";
-
-  var tp    = { src: input_src, idx: 0 };
-  var input = parse_term(tp, new Map());
-  console.log("input:", show_term(input));
+  // Call: ~(0,(0,<65535>)) = main(65535)
+  var input_src = "~(0,(0," + n + "))";
+  var input     = parse_term({src: input_src, idx: 0}, new Map());
 
   // Evaluate and print
   var stats  = new_stats();
   var result = eval_term(prog, input, stats);
-  console.log("result:", show_term(result));
-  // Expected: 0{} (halted after counting down to zero)
+  console.log(show_term(result));
+  // Expected: (0,()) (halted after counting down to zero)
 
   // Print interaction stats
   console.log(show_stats(stats));
 }
 
-main();
+test();
+
+// That works very well - good job!
+// Sadly, the TS interpreter is too slow. The term above returns:
+// (0,())
+// Interactions: 56622872
+// - APP-FUN: 6291433
+// - APP-LAM: 6291432
+// - APP-MAT: 22020003
+// - APP-GET: 22020003
+// - APP-USE: 1
+// In 5 seconds. That means it achieves only about ~11m interactions/s. 
+
+// Now, your goal is to extend LamBit with a fast, memory-efficient C compiler.
+// To achieve that, we will represent memory using U16 Ptrs, where:
+// Ptr ::= Ctr | Loc
+// Ctr ::= NUL | TUP | BT0 | BT1
+// Loc ::= 14-bit address
+// The top-level program will be *fully compiled* to a single, efficient, native
+// C function. That means we don't need to implement VAR or REC as Term
+// variants, since these are just part of the compiled C function, and not valid
+// as runtime terms. We also need to implement a very fast allocator and
+// ref-counted garbage collector.  The allocator will be dead simple: it will
+// just be a bump allocator that wraps around the complete heap (which is a
+// buffer with 2^14 u16 Terms) seeking an empty slot (==0). The garbage
+// collector will simply free() a Term and its children recursively when its
+// ref-count goes to 0. The ref-count of a reference decreases when it is passed
+// to a lambda that doesn't use it on the returned Term.
+// The C compiler will receive a LamBit program as its input, and output a C
+// program that applies it to an input, and prints the result, including stats,
+// as fast as possible. Example usage:
+// $ lambit main.lb -o main
+// $ ./main "~(0,(0,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(1,(0,())))))))))))))))))))))))))))))))))))))))))))"
+// should output exactly the same as test() above, but in *much* less time.
+// Your ultimate goal is to:
+// - implement the compiler correctly
+// - make it as fast as you can
+// Start working on this now.
