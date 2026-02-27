@@ -125,6 +125,7 @@ static void free_term(uint16_t p) {
 #define OP_USE 0x04
 #define OP_GET 0x05
 #define OP_REC 0x06
+#define OP_ERA 0x07
 #define OP_VAR_BASE 0x08
 #define OP_VAR_MAX  0x1F
 #define OP_MAT_BASE 0x20
@@ -208,6 +209,7 @@ static int is_name_char(char c) {
 
 #define MAX_NAMES 64
 static char  cname_buf[MAX_NAMES][32];
+static int   cname_used[MAX_NAMES];
 static int   cname_depth = 0;
 
 static void parse_name_into(Src *s, char *out, int maxlen) {
@@ -315,15 +317,18 @@ static void compile_func(Src *s) {
       compile_func(s);
       return;
     }
-    // Lam: λName. Func
+    // Lam: λName. Func (or ERA if var unused)
     char nm[32];
     parse_name_into(s, nm, 32);
     src_expect(s, ".");
-    emit(OP_LAM);
+    uint32_t lam_pos = code_len;
+    emit(0); // placeholder: patched to LAM or ERA
     strcpy(cname_buf[cname_depth], nm);
+    cname_used[cname_depth] = 0;
     cname_depth++;
     compile_func(s);
     cname_depth--;
+    code[lam_pos] = cname_used[cname_depth] ? OP_LAM : OP_ERA;
     return;
   }
 
@@ -388,6 +393,7 @@ static void compile_term(Src *s) {
   parse_name_into(s, nm, 32);
   int dbi = find_name_dbi(nm);
   if (dbi < 0) { fprintf(stderr, "Unbound variable '%s'\n", nm); exit(1); }
+  cname_used[cname_depth - 1 - dbi] = 1;
   if (dbi > (OP_VAR_MAX - OP_VAR_BASE)) {
     fprintf(stderr, "Variable index too large: %d\n", dbi);
     exit(1);
@@ -403,6 +409,7 @@ static void print_code(uint32_t pc, int indent) {
   if (op == OP_BT1) { printf("BT1"); return; }
   if (op >= OP_VAR_BASE && op <= OP_VAR_MAX) { printf("VAR(%d)", op - OP_VAR_BASE); return; }
   if (op == OP_LAM) { printf("LAM "); print_code(pc+1, indent); return; }
+  if (op == OP_ERA) { printf("ERA "); print_code(pc+1, indent); return; }
   if (op == OP_USE) { printf("USE "); print_code(pc+1, indent); return; }
   if (op == OP_GET) { printf("GET "); print_code(pc+1, indent); return; }
   if (op == OP_REC) { printf("REC "); print_code(pc+1, indent); return; }
@@ -457,9 +464,14 @@ static uint32_t feed_term(uint32_t pc, uint16_t term) {
 
     if (op == OP_LAM) {
       stat_lam++;
-      sub_stack[sub_sp] = term;
-      sub_sp++;
-      if (sub_sp > max_sub_sp) max_sub_sp = sub_sp;
+      sub_stack[sub_sp++] = term;
+      return pc + 1;
+    }
+
+    if (op == OP_ERA) {
+      stat_lam++;
+      free_term(term);
+      sub_stack[sub_sp++] = 0; // placeholder for index alignment
       return pc + 1;
     }
 
@@ -480,7 +492,7 @@ static uint32_t feed_term(uint32_t pc, uint16_t term) {
 }
 
 // ---- Evaluator ----
-// Goto-based dispatch, packed u32 continuations, TUP(d=1) fusion.
+// Goto dispatch, packed u32 conts, TUP(d=1) fusion, deforestation.
 
 static uint16_t __attribute__((hot, flatten)) eval_iterative(uint32_t start_pc) {
   uint32_t pc  = start_pc;
@@ -495,7 +507,6 @@ static uint16_t __attribute__((hot, flatten)) eval_iterative(uint32_t start_pc) 
     // Most common: TUP (opcode >= 0x90)
     if (__builtin_expect(op >= OP_TUP_BASE, 1)) {
       uint32_t delta = op - OP_TUP_BASE;
-      // Fast path: d=1 means fst is a single-byte leaf
       if (__builtin_expect(delta == 1, 1)) {
         uint8_t fst_op = cc[pc + 1];
         uint16_t fst_val;
@@ -509,21 +520,20 @@ static uint16_t __attribute__((hot, flatten)) eval_iterative(uint32_t start_pc) 
         } else {
           goto tup_slow;
         }
-        // Skip CONT_TUP_SND, push DONE directly
         cont_stack[cont_sp++] = CONT_MAKE(CONT_TUP_DONE, fst_val);
-        pc = pc + 2;
+        pc += 2;
         goto eval;
       }
       tup_slow:
       cont_stack[cont_sp++] = CONT_MAKE(CONT_TUP_SND, pc + 1 + delta);
-      pc = pc + 1;
+      pc += 1;
       goto eval;
     }
 
     if (op == OP_REC) {
       stat_fun++;
       cont_stack[cont_sp++] = CONT_MAKE(CONT_REC, sub_sp);
-      pc = pc + 1;
+      pc += 1;
       goto eval;
     }
     if (op == OP_NUL) { val = PTR_NUL; goto ret; }
@@ -543,15 +553,13 @@ static uint16_t __attribute__((hot, flatten)) eval_iterative(uint32_t start_pc) 
     if (__builtin_expect(cont_sp == 0, 0)) return val;
     uint32_t c = cont_stack[cont_sp - 1];
 
-    // Most common: TUP_DONE chain — tight loop for consecutive DONEs
+    // Most common: TUP_DONE chain
     if (__builtin_expect(CONT_TAG_OF(c) == CONT_TUP_DONE, 1)) {
       for (;;) {
         cont_sp--;
-        // Check next cont before allocating
         if (__builtin_expect(cont_sp > 0, 1)) {
           uint32_t nc  = cont_stack[cont_sp - 1];
           uint32_t nct = CONT_TAG_OF(nc);
-          // Next is another DONE: make tuple, continue chain
           if (__builtin_expect(nct == CONT_TUP_DONE, 1)) {
             val = make_tup(CONT_VAL_OF(c), val);
             c = nc;
@@ -584,14 +592,13 @@ static uint16_t __attribute__((hot, flatten)) eval_iterative(uint32_t start_pc) 
             goto eval;
           }
         }
-        // Non-DONE next (or empty stack): make tuple and exit chain
         val = make_tup(CONT_VAL_OF(c), val);
         break;
       }
       goto ret;
     }
 
-    // Second most common: TUP_SND (rewrite in place to DONE)
+    // TUP_SND: rewrite in place to DONE
     if (CONT_TAG_OF(c) == CONT_TUP_SND) {
       cont_stack[cont_sp - 1] = CONT_MAKE(CONT_TUP_DONE, val);
       pc = CONT_VAL_OF(c);
@@ -604,31 +611,25 @@ static uint16_t __attribute__((hot, flatten)) eval_iterative(uint32_t start_pc) 
         saved_sp = CONT_VAL_OF(c);
         goto post_feed;
       }
-
       case CONT_TAIL_REC: {
         saved_sp = CONT_VAL_OF(c);
-        for (uint32_t i = saved_sp; i < sub_sp; i++) {
+        for (uint32_t i = saved_sp; i < sub_sp; i++)
           if (sub_stack[i] != 0) free_term(sub_stack[i]);
-        }
         sub_sp = saved_sp;
         goto post_feed;
       }
-
       case CONT_REC_GC: {
         uint32_t sp = CONT_VAL_OF(c);
-        for (uint32_t i = sp; i < sub_sp; i++) {
+        for (uint32_t i = sp; i < sub_sp; i++)
           if (sub_stack[i] != 0) free_term(sub_stack[i]);
-        }
         sub_sp = sp;
         goto ret;
       }
-
       default: __builtin_unreachable();
     }
   }
 
-  // ---- POST_FEED: shared by CONT_REC and CONT_TAIL_REC ----
-  // Inline first GET+MAT (every LamBit program starts with λ! λ{}).
+  // ---- POST_FEED: inline first GET+MAT, then feed_term ----
   post_feed: {
     stat_get++;
     uint32_t loc0 = LOC(val);
