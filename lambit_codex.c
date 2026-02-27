@@ -62,7 +62,6 @@
 #define MAX_SUB     64
 #define MAX_FEED    CODE_SIZE
 #define MAX_EVAL    CODE_SIZE
-#define MAX_FREE    (HEAP_SIZE / 2)
 
 // Set to 1 to enable hot-path runtime checks.
 #ifndef LAMBIT_SAFE_CHECKS
@@ -128,6 +127,12 @@ typedef uint32_t Ptr;
 typedef uint16_t Ptr;
 #endif
 
+#if LAMBIT_PTR_BITS == 32
+typedef uint64_t Cont;
+#else
+typedef uint32_t Cont;
+#endif
+
 enum {
   CTR_NUL = 0,
   CTR_TUP = 1,
@@ -182,19 +187,9 @@ typedef struct {
   int         bind_len;
 } Parser;
 
-typedef struct {
-  const Code* code;
-  uint32_t    pc;
-  uint32_t    rhs_pc;
-  uint32_t    base_sp;
-  Ptr         lhs;
-  uint8_t     mode;
-} EvalFrame;
-
 static Ptr   HEAP[HEAP_SIZE] __attribute__((aligned(64)));
 static uint16_t HP = 2; // bump cursor
-static uint16_t FREE[MAX_FREE];
-static uint16_t FREE_SP = 0;
+static uint16_t FREE_HEAD = 0;
 static Stats STATS;
 static const Code* PROG_CODE = NULL;
 static uint32_t PROG_PC = 0;
@@ -202,7 +197,7 @@ static bool PROG_TOP_GET = false;
 static Ptr SUB_STACK[MAX_SUB];
 static uint32_t SUB_SP = 0;
 static Ptr FEED_STACK[MAX_FEED];
-static EvalFrame EVAL_STACK[MAX_EVAL];
+static Cont EVAL_CONT_STACK[MAX_EVAL];
 
 static void die(const char* fmt, ...) {
   va_list ap;
@@ -241,14 +236,14 @@ static inline bool is_tup(uint8_t op) {
 
 static inline void free2(uint16_t l) {
 #if LAMBIT_FREE_LIST && LAMBIT_TRUST_AFFINE
-  HOT_ASSERT(FREE_SP < MAX_FREE, "Tuple free-list overflow.");
-  FREE[FREE_SP++] = l;
+  HEAP[l + 0] = FREE_HEAD;
+  FREE_HEAD = l;
 #else
   HEAP[l + 0] = 0;
   HEAP[l + 1] = 0;
 #if LAMBIT_FREE_LIST
-  HOT_ASSERT(FREE_SP < MAX_FREE, "Tuple free-list overflow.");
-  FREE[FREE_SP++] = l;
+  HEAP[l + 0] = FREE_HEAD;
+  FREE_HEAD = l;
 #else
   (void)l;
 #endif
@@ -270,8 +265,9 @@ static void gc_term(Ptr p) {
 
 static uint16_t alloc2(void) {
 #if LAMBIT_FREE_LIST
-  if (LIKELY(FREE_SP != 0)) {
-    uint16_t l = FREE[--FREE_SP];
+  if (LIKELY(FREE_HEAD != 0)) {
+    uint16_t l = FREE_HEAD;
+    FREE_HEAD = (uint16_t)HEAP[l + 0];
 #if !LAMBIT_TRUST_AFFINE
     HOT_ASSERT(HEAP[l + 0] == 0 && HEAP[l + 1] == 0, "Corrupt free-list entry.");
 #endif
@@ -625,6 +621,18 @@ L_GET: {
     Ptr a = HEAP[l + 0];
     Ptr b = HEAP[l + 1];
     free2(l);
+
+    uint8_t nxt = PROG_CODE->buf[pc + 1];
+    if (is_mat(nxt)) {
+#if LAMBIT_COUNT_STATS
+      app_mat++;
+#endif
+      uint32_t d = (uint32_t)(nxt - OP_MAT);
+      pc = (a == PTR_BT0) ? (pc + 2) : (pc + 2 + d);
+      arg = b;
+      FEED_DISPATCH();
+    }
+
     FEED_STACK[feed_sp++] = b;
     pc = pc + 1;
     arg = a;
@@ -681,190 +689,247 @@ L_BAD: {
 }
 
 enum {
-  EVAL_ENTER   = 0,
-  EVAL_TUP_LHS = 1,
-  EVAL_TUP_RHS = 2,
-  EVAL_REC_ARG = 3,
+  CONT_TUP_SND  = 1,
+  CONT_TUP_DONE = 2,
+  CONT_REC_FEED = 3,
+  CONT_REC_DONE = 4,
 };
 
+#if LAMBIT_PTR_BITS == 16
+#define CONT_MAKE(tag, code_id, saved_sp, payload) \
+  ((((uint32_t)(tag)      & 0x7Fu) << 25) | \
+   (((uint32_t)(code_id)  & 0x01u) << 24) | \
+   (((uint32_t)(saved_sp) & 0xFFu) << 16) | \
+   (((uint32_t)(payload)  & 0xFFFFu) << 0))
+
+#define CONT_TAG(c)      ((uint8_t)(((c) >> 25) & 0x7Fu))
+#define CONT_CODE_ID(c)  ((uint8_t)(((c) >> 24) & 0x01u))
+#define CONT_SAVED_SP(c) ((uint8_t)(((c) >> 16) & 0xFFu))
+#define CONT_PAYLOAD(c)  ((uint32_t)((c) & 0xFFFFu))
+#else
+#define CONT_MAKE(tag, code_id, saved_sp, payload) \
+  ((((uint64_t)(tag)      & 0xFFull) << 48) | \
+   (((uint64_t)(code_id)  & 0xFFull) << 40) | \
+   (((uint64_t)(saved_sp) & 0xFFull) << 32) | \
+   (((uint64_t)(payload)  & 0xFFFFFFFFull) << 0))
+
+#define CONT_TAG(c)      ((uint8_t)(((c) >> 48) & 0xFFull))
+#define CONT_CODE_ID(c)  ((uint8_t)(((c) >> 40) & 0xFFull))
+#define CONT_SAVED_SP(c) ((uint8_t)(((c) >> 32) & 0xFFull))
+#define CONT_PAYLOAD(c)  ((uint32_t)((c) & 0xFFFFFFFFull))
+#endif
+
 // Evaluates a term to normal form.
-static Ptr eval_term(const Code* c, uint32_t pc) {
+static Ptr eval_term(const Code* c, uint32_t start_pc) {
+  enum {
+    CODE_INPUT = 0,
+    CODE_PROG  = 1,
+  };
+
   uint8_t op = 0;
-  Ptr ret = PTR_NUL;
-  uint32_t eval_sp = 0;
-  EvalFrame* frm = NULL;
+  Ptr val = PTR_NUL;
+  uint32_t pc = start_pc;
+  uint8_t code_id = CODE_INPUT;
+  uint32_t cont_sp = 0;
   uint32_t sub_sp = SUB_SP;
   uint64_t app_fun = STATS.app_fun;
   uint64_t app_lam = STATS.app_lam;
   uint64_t app_mat = STATS.app_mat;
   uint64_t app_get = STATS.app_get;
   uint64_t app_use = STATS.app_use;
+  const uint8_t* code_buf[2] = { c->buf, PROG_CODE->buf };
 
-  EVAL_STACK[eval_sp++] = (EvalFrame){
-    .code = c,
-    .pc = pc,
-    .base_sp = sub_sp,
-  };
-
-#if LAMBIT_COMPUTED_GOTO_EVAL
-  static bool init = false;
-  static void* jump_tbl[256];
-  if (UNLIKELY(!init)) {
-    for (uint32_t i = 0; i < 256; ++i) jump_tbl[i] = &&L_BAD;
-    jump_tbl[OP_NUL] = &&L_NUL;
-    jump_tbl[OP_BT0] = &&L_BT0;
-    jump_tbl[OP_BT1] = &&L_BT1;
-    jump_tbl[OP_REC] = &&L_REC;
-    for (uint32_t i = OP_VAR; i <= 0x1F; ++i) jump_tbl[i] = &&L_VAR;
-    for (uint32_t i = OP_TUP; i <= 0xFF; ++i) jump_tbl[i] = &&L_TUP;
-    init = true;
-  }
-
-#define EVAL_DISPATCH() do { \
-    frm = &EVAL_STACK[eval_sp - 1]; \
-    op = frm->code->buf[frm->pc]; \
-    goto *jump_tbl[op]; \
-  } while (0)
-#else
-#define EVAL_DISPATCH() do { \
-    frm = &EVAL_STACK[eval_sp - 1]; \
-    op = frm->code->buf[frm->pc]; \
-    goto L_SWITCH; \
-  } while (0)
-#endif
-
-#define EVAL_PUSH(next_code, next_pc) do { \
-    HOT_ASSERT(eval_sp < MAX_EVAL, "Eval stack overflow."); \
-    EVAL_STACK[eval_sp].code = (next_code); \
-    EVAL_STACK[eval_sp].pc = (next_pc); \
-    EVAL_STACK[eval_sp].base_sp = sub_sp; \
-    eval_sp++; \
+#define CONT_PUSH(tag, cid, ssp, pay) do { \
+    HOT_ASSERT(cont_sp < MAX_EVAL, "Eval continuation stack overflow."); \
+    EVAL_CONT_STACK[cont_sp++] = CONT_MAKE((tag), (cid), (ssp), (pay)); \
   } while (0)
 
-#define EVAL_RET(val) do { \
-    ret = (val); \
-    frm = &EVAL_STACK[eval_sp - 1]; \
-    sub_sp = frm->base_sp; \
-    eval_sp--; \
-    if (eval_sp == 0) { \
-      SUB_SP = sub_sp; \
-      STATS.app_fun = app_fun; \
-      STATS.app_lam = app_lam; \
-      STATS.app_mat = app_mat; \
-      STATS.app_get = app_get; \
-      STATS.app_use = app_use; \
-      return ret; \
-    } \
-    goto L_CONT; \
-  } while (0)
+L_EVAL: {
+    op = code_buf[code_id][pc];
 
-  EVAL_DISPATCH();
-
-#if !LAMBIT_COMPUTED_GOTO_EVAL
-L_SWITCH: {
-    if (is_tup(op)) goto L_TUP;
+    if (LIKELY(is_tup(op))) goto L_TUP;
     if (is_var(op)) goto L_VAR;
-    if (op == OP_REC) goto L_REC;
-    if (op == OP_NUL) goto L_NUL;
-    if (op == OP_BT0) goto L_BT0;
-    if (op == OP_BT1) goto L_BT1;
-    goto L_BAD;
-  }
+
+    if (op == OP_REC) {
+#if LAMBIT_COUNT_STATS
+      app_fun++;
 #endif
-
-L_NUL: {
-    EVAL_RET(PTR_NUL);
-  }
-
-L_BT0: {
-    EVAL_RET(PTR_BT0);
-  }
-
-L_BT1: {
-    EVAL_RET(PTR_BT1);
+      if (cont_sp > 0) {
+        Cont c0 = EVAL_CONT_STACK[cont_sp - 1];
+        if (CONT_TAG(c0) == CONT_REC_DONE) {
+          uint32_t saved_sp = CONT_SAVED_SP(c0);
+          EVAL_CONT_STACK[cont_sp - 1] = CONT_MAKE(CONT_REC_FEED, 0, saved_sp, 0);
+          pc = pc + 1;
+          goto L_EVAL;
+        }
+      }
+      CONT_PUSH(CONT_REC_FEED, 0, sub_sp, 0);
+      pc = pc + 1;
+      goto L_EVAL;
+    }
+    if (op == OP_NUL) {
+      val = PTR_NUL;
+      goto L_RET;
+    }
+    if (op == OP_BT0) {
+      val = PTR_BT0;
+      goto L_RET;
+    }
+    if (op == OP_BT1) {
+      val = PTR_BT1;
+      goto L_RET;
+    }
+    goto L_BAD;
   }
 
 L_VAR: {
     uint8_t idx = (uint8_t)(op - OP_VAR);
     HOT_ASSERT(idx < sub_sp, "Variable out of scope: idx=%u sub_sp=%u", idx, sub_sp);
-    Ptr val = SUB_STACK[sub_sp - 1 - idx];
-    EVAL_RET(val);
+    val = SUB_STACK[sub_sp - 1 - idx];
+    goto L_RET;
   }
 
 L_TUP: {
     uint32_t d = (uint32_t)(op - OP_TUP);
-    frm->rhs_pc = frm->pc + 1 + d;
-    frm->mode = EVAL_TUP_LHS;
-    EVAL_PUSH(frm->code, frm->pc + 1);
-    EVAL_DISPATCH();
-  }
+    if (d == 1) {
+      uint8_t fst_op = code_buf[code_id][pc + 1];
+      Ptr fst_val = PTR_NUL;
 
-L_REC: {
-#if LAMBIT_COUNT_STATS
-    app_fun++;
-#endif
-    frm->mode = EVAL_REC_ARG;
-    EVAL_PUSH(frm->code, frm->pc + 1);
-    EVAL_DISPATCH();
-  }
-
-L_CONT: {
-    frm = &EVAL_STACK[eval_sp - 1];
-    switch (frm->mode) {
-      case EVAL_TUP_LHS: {
-        frm->lhs = ret;
-        frm->mode = EVAL_TUP_RHS;
-        EVAL_PUSH(frm->code, frm->rhs_pc);
-        EVAL_DISPATCH();
+      if (fst_op == OP_NUL) {
+        fst_val = PTR_NUL;
+      } else if (fst_op == OP_BT0) {
+        fst_val = PTR_BT0;
+      } else if (fst_op == OP_BT1) {
+        fst_val = PTR_BT1;
+      } else if (is_var(fst_op)) {
+        uint8_t idx = (uint8_t)(fst_op - OP_VAR);
+        HOT_ASSERT(idx < sub_sp, "Variable out of scope: idx=%u sub_sp=%u", idx, sub_sp);
+        fst_val = SUB_STACK[sub_sp - 1 - idx];
+      } else {
+        goto L_TUP_SLOW;
       }
-      case EVAL_TUP_RHS: {
-        if (PROG_TOP_GET && eval_sp >= 2) {
-          EvalFrame* par = &EVAL_STACK[eval_sp - 2];
-          if (par->mode == EVAL_REC_ARG) {
+
+      CONT_PUSH(CONT_TUP_DONE, 0, sub_sp, fst_val);
+      pc = pc + 2;
+      goto L_EVAL;
+    }
+
+L_TUP_SLOW:
+    CONT_PUSH(CONT_TUP_SND, code_id, sub_sp, pc + 1 + d);
+    pc = pc + 1;
+    goto L_EVAL;
+  }
+
+L_RET: {
+    if (cont_sp == 0) goto L_DONE;
+    Cont c0 = EVAL_CONT_STACK[cont_sp - 1];
+    uint8_t tag = CONT_TAG(c0);
+
+    if (LIKELY(tag == CONT_TUP_DONE)) {
+      for (;;) {
+        sub_sp = CONT_SAVED_SP(c0);
+
+        if (PROG_TOP_GET && cont_sp >= 2) {
+          Cont c1 = EVAL_CONT_STACK[cont_sp - 2];
+          if (CONT_TAG(c1) == CONT_REC_FEED) {
+            uint32_t saved_sp = CONT_SAVED_SP(c1);
             sub_sp = 0;
 #if LAMBIT_COUNT_STATS
             app_get++;
 #endif
             uint32_t body_pc = feed_term(
-              PROG_PC + 1, frm->lhs, &sub_sp, &app_lam, &app_mat, &app_get, &app_use
+              PROG_PC + 1, (Ptr)CONT_PAYLOAD(c0), &sub_sp, &app_lam, &app_mat, &app_get, &app_use
             );
             body_pc = feed_term(
-              body_pc, ret, &sub_sp, &app_lam, &app_mat, &app_get, &app_use
+              body_pc, val, &sub_sp, &app_lam, &app_mat, &app_get, &app_use
             );
-            par->code = PROG_CODE;
-            par->pc = body_pc;
-            par->mode = EVAL_ENTER;
-            eval_sp--;
-            EVAL_DISPATCH();
+            EVAL_CONT_STACK[cont_sp - 2] = CONT_MAKE(CONT_REC_DONE, 0, saved_sp, 0);
+            cont_sp = cont_sp - 1;
+            code_id = CODE_PROG;
+            pc = body_pc;
+            goto L_EVAL;
           }
         }
-        Ptr tup = mk_tup(frm->lhs, ret);
-        EVAL_RET(tup);
+
+        val = mk_tup((Ptr)CONT_PAYLOAD(c0), val);
+        cont_sp = cont_sp - 1;
+        if (cont_sp == 0) goto L_DONE;
+        c0 = EVAL_CONT_STACK[cont_sp - 1];
+        if (CONT_TAG(c0) != CONT_TUP_DONE) break;
       }
-      case EVAL_REC_ARG: {
-        sub_sp = 0;
-        frm->code = PROG_CODE;
-        frm->pc = feed_term(
-          PROG_PC, ret, &sub_sp, &app_lam, &app_mat, &app_get, &app_use
-        );
-        EVAL_DISPATCH();
-      }
-      default: {
-        die("Invalid eval continuation mode %u.", (unsigned)frm->mode);
-      }
+      goto L_RET;
     }
+
+    if (tag == CONT_TUP_SND) {
+      sub_sp = CONT_SAVED_SP(c0);
+      EVAL_CONT_STACK[cont_sp - 1] = CONT_MAKE(CONT_TUP_DONE, 0, sub_sp, val);
+      code_id = CONT_CODE_ID(c0);
+      pc = CONT_PAYLOAD(c0);
+      goto L_EVAL;
+    }
+
+    if (tag == CONT_REC_FEED) {
+      uint32_t saved_sp = CONT_SAVED_SP(c0);
+      sub_sp = 0;
+      EVAL_CONT_STACK[cont_sp - 1] = CONT_MAKE(CONT_REC_DONE, 0, saved_sp, 0);
+      code_id = CODE_PROG;
+
+      if (PROG_TOP_GET) {
+        HOT_ASSERT(PTR_TAG(val) == CTR_TUP, "Get expected tuple.");
+#if LAMBIT_COUNT_STATS
+        app_get++;
+#endif
+        uint16_t l = PTR_LOC(val);
+        Ptr a = HEAP[l + 0];
+        Ptr b = HEAP[l + 1];
+        free2(l);
+
+        uint8_t mat_op = code_buf[CODE_PROG][PROG_PC + 1];
+        HOT_ASSERT(is_mat(mat_op), "Expected MAT after top-level GET.");
+#if LAMBIT_COUNT_STATS
+        app_mat++;
+#endif
+        uint32_t d = (uint32_t)(mat_op - OP_MAT);
+        uint32_t nxt_pc = (a == PTR_BT0) ? (PROG_PC + 2) : (PROG_PC + 2 + d);
+        pc = feed_term(nxt_pc, b, &sub_sp, &app_lam, &app_mat, &app_get, &app_use);
+      } else {
+        pc = feed_term(PROG_PC, val, &sub_sp, &app_lam, &app_mat, &app_get, &app_use);
+      }
+      goto L_EVAL;
+    }
+
+    if (tag == CONT_REC_DONE) {
+      sub_sp = CONT_SAVED_SP(c0);
+      cont_sp = cont_sp - 1;
+      goto L_RET;
+    }
+
+    die("Invalid eval continuation tag %u.", (unsigned)tag);
   }
 
 L_BAD: {
-    uint32_t bad_pc = frm ? frm->pc : pc;
-    die("Expected term opcode, got 0x%02X at pc=%u.", op, bad_pc);
+    die("Expected term opcode, got 0x%02X at pc=%u.", op, pc);
   }
 
-#undef EVAL_RET
-#undef EVAL_PUSH
-#undef EVAL_DISPATCH
+L_DONE: {
+    SUB_SP = sub_sp;
+    STATS.app_fun = app_fun;
+    STATS.app_lam = app_lam;
+    STATS.app_mat = app_mat;
+    STATS.app_get = app_get;
+    STATS.app_use = app_use;
+    return val;
+  }
+
+#undef CONT_PUSH
   return PTR_NUL;
 }
+
+#undef CONT_PAYLOAD
+#undef CONT_SAVED_SP
+#undef CONT_CODE_ID
+#undef CONT_TAG
+#undef CONT_MAKE
 
 // ---------------- Show ----------------
 
