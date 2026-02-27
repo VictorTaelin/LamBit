@@ -59,6 +59,12 @@
 #define MAX_DEPTH   24
 #define MAX_BINDS   256
 #define NAME_SIZE   64
+#define MAX_SUB     64
+
+// Set to 1 to enable hot-path runtime checks.
+#ifndef LAMBIT_SAFE_CHECKS
+#define LAMBIT_SAFE_CHECKS 0
+#endif
 
 typedef uint16_t Ptr;
 
@@ -115,18 +121,13 @@ typedef struct {
   int         bind_len;
 } Parser;
 
-typedef struct {
-  const Code* code;
-  uint32_t    pc;
-  uint8_t     depth;
-  Ptr         env[MAX_DEPTH];
-} Clo;
-
 static Ptr   HEAP[HEAP_SIZE] __attribute__((aligned(64)));
 static uint16_t HP = 2; // bump cursor
 static Stats STATS;
 static const Code* PROG_CODE = NULL;
 static uint32_t PROG_PC = 0;
+static Ptr SUB_STACK[MAX_SUB];
+static uint32_t SUB_SP = 0;
 
 static void die(const char* fmt, ...) {
   va_list ap;
@@ -137,12 +138,15 @@ static void die(const char* fmt, ...) {
   exit(1);
 }
 
+#if LAMBIT_SAFE_CHECKS
+#define HOT_ASSERT(cond, ...) do { if (!(cond)) die(__VA_ARGS__); } while (0)
+#else
+#define HOT_ASSERT(cond, ...) ((void)0)
+#endif
+
 static inline bool is_var(uint8_t op) { return op >= 0x08 && op <= 0x1F; }
 static inline bool is_mat(uint8_t op) { return op >= 0x20 && op <= 0x8F; }
 static inline bool is_tup(uint8_t op) { return op >= 0x90; }
-static inline bool is_func_node(uint8_t op) {
-  return op == OP_LAM || op == OP_USE || op == OP_GET || is_mat(op);
-}
 
 static void gc_term(Ptr p) {
   if (PTR_TAG(p) != CTR_TUP) return;
@@ -406,101 +410,98 @@ static uint32_t compile_term(Code* out, const char* src) {
 
 // ---------------- Eval ----------------
 
-static Ptr eval_term(const Code* c, uint32_t pc, const Ptr* env, uint8_t depth);
+static Ptr eval_term(const Code* c, uint32_t pc);
 
-static void apply(Clo* f, Ptr arg) {
+// Feeds one term argument into a function starting at `pc`.
+static uint32_t feed_term(uint32_t pc, Ptr arg) {
   for (;;) {
-    uint8_t op = f->code->buf[f->pc];
+    uint8_t op = PROG_CODE->buf[pc];
 
     if (op == OP_GET) {
-      if (PTR_TAG(arg) != CTR_TUP) die("Get expected tuple.");
+      HOT_ASSERT(PTR_TAG(arg) == CTR_TUP, "Get expected tuple.");
       STATS.app_get++;
       uint16_t l = PTR_LOC(arg);
       Ptr a = HEAP[l + 0];
       Ptr b = HEAP[l + 1];
       HEAP[l + 0] = 0;
       HEAP[l + 1] = 0;
-      f->pc = f->pc + 1;
-      apply(f, a);
+      pc = pc + 1;
+      pc = feed_term(pc, a);
       arg = b;
       continue;
     }
 
     if (op == OP_LAM) {
       STATS.app_lam++;
-      if (!f->code->lam_used[f->pc]) {
+      HOT_ASSERT(SUB_SP < MAX_SUB, "Substitution stack overflow.");
+      if (!PROG_CODE->lam_used[pc]) {
         gc_term(arg);
       }
-      if (f->depth >= MAX_DEPTH) die("Environment depth overflow.");
-      f->env[f->depth++] = arg;
-      f->pc = f->pc + 1;
-      return;
+      SUB_STACK[SUB_SP++] = arg;
+      return pc + 1;
     }
 
     if (op == OP_USE) {
-      if (PTR_TAG(arg) != CTR_NUL) die("Use expected ().");
+      HOT_ASSERT(PTR_TAG(arg) == CTR_NUL, "Use expected ().");
       STATS.app_use++;
-      f->pc = f->pc + 1;
-      return;
+      return pc + 1;
     }
 
     if (is_mat(op)) {
-      if (PTR_TAG(arg) != CTR_BT0 && PTR_TAG(arg) != CTR_BT1) {
-        die("Mat expected 0/1 bit.");
-      }
+      HOT_ASSERT(PTR_TAG(arg) == CTR_BT0 || PTR_TAG(arg) == CTR_BT1, "Mat expected 0/1 bit.");
       STATS.app_mat++;
       uint32_t d = (uint32_t)(op - OP_MAT);
-      f->pc = (PTR_TAG(arg) == CTR_BT0) ? (f->pc + 1) : (f->pc + 1 + d);
-      return;
+      return (PTR_TAG(arg) == CTR_BT0) ? (pc + 1) : (pc + 1 + d);
     }
 
-    die("Cannot apply non-function opcode 0x%02X at pc=%u.", op, f->pc);
+    die("Cannot apply non-function opcode 0x%02X at pc=%u.", op, pc);
   }
 }
 
-static Ptr eval_term(const Code* c, uint32_t pc, const Ptr* env, uint8_t depth) {
-  Ptr env_buf[MAX_DEPTH];
+// Evaluates a term to normal form.
+static Ptr eval_term(const Code* c, uint32_t pc) {
+  uint32_t base_sp = SUB_SP;
+
   for (;;) {
     uint8_t op = c->buf[pc];
 
-    if (op == OP_NUL) return PTR_NUL;
-    if (op == OP_BT0) return PTR_BT0;
-    if (op == OP_BT1) return PTR_BT1;
+    if (op == OP_NUL) {
+      SUB_SP = base_sp;
+      return PTR_NUL;
+    }
+    if (op == OP_BT0) {
+      SUB_SP = base_sp;
+      return PTR_BT0;
+    }
+    if (op == OP_BT1) {
+      SUB_SP = base_sp;
+      return PTR_BT1;
+    }
 
     if (is_var(op)) {
       uint8_t idx = (uint8_t)(op - OP_VAR);
-      if (idx >= depth) die("Variable out of scope: idx=%u depth=%u", idx, depth);
-      return env[depth - 1 - idx];
+      HOT_ASSERT(idx < SUB_SP, "Variable out of scope: idx=%u sub_sp=%u", idx, SUB_SP);
+      Ptr val = SUB_STACK[SUB_SP - 1 - idx];
+      SUB_SP = base_sp;
+      return val;
     }
 
     if (is_tup(op)) {
       uint32_t d = (uint32_t)(op - OP_TUP);
-      Ptr a = eval_term(c, pc + 1, env, depth);
-      Ptr b = eval_term(c, pc + 1 + d, env, depth);
-      return mk_tup(a, b);
+      Ptr a = eval_term(c, pc + 1);
+      Ptr b = eval_term(c, pc + 1 + d);
+      Ptr t = mk_tup(a, b);
+      SUB_SP = base_sp;
+      return t;
     }
 
     if (op == OP_REC) {
       STATS.app_fun++;
-      Ptr arg = eval_term(c, pc + 1, env, depth);
-
-      Clo f = {0};
-      f.code = PROG_CODE;
-      f.pc = PROG_PC;
-      f.depth = 0;
-
-      apply(&f, arg);
-
-      uint8_t rop = f.code->buf[f.pc];
-      if (is_func_node(rop)) {
-        die("Expected term after full application, got function opcode 0x%02X.", rop);
-      }
-
-      memcpy(env_buf, f.env, (size_t)f.depth * sizeof(Ptr));
-      c = f.code;
-      pc = f.pc;
-      env = env_buf;
-      depth = f.depth;
+      Ptr arg = eval_term(c, pc + 1);
+      SUB_SP = 0;
+      uint32_t body_pc = feed_term(PROG_PC, arg);
+      c = PROG_CODE;
+      pc = body_pc;
       continue;
     }
 
@@ -543,6 +544,7 @@ static void show_stats(const Stats* s) {
 int main(int argc, char** argv) {
   memset(HEAP, 0, sizeof(HEAP));
   memset(&STATS, 0, sizeof(STATS));
+  memset(SUB_STACK, 0, sizeof(SUB_STACK));
 
   const char* prog_src = NULL;
   char* input_heap = NULL;
@@ -599,7 +601,8 @@ int main(int argc, char** argv) {
   PROG_CODE = &prog;
   uint32_t input_pc = compile_term(&input, input_heap);
 
-  Ptr result = eval_term(&input, input_pc, NULL, 0);
+  SUB_SP = 0;
+  Ptr result = eval_term(&input, input_pc);
   show_ptr(result);
   printf("\n");
   show_stats(&STATS);
