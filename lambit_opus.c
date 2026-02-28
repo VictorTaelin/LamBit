@@ -36,25 +36,9 @@
 static uint32_t heap[HEAP_SIZE / 2] __attribute__((aligned(64)));
 static uint16_t free_head = 0;
 
-// Reads packed pair as u32 (fst in low 16, snd in high 16)
-static inline uint32_t heap_pair(uint16_t loc) {
-  return heap[loc >> 1];
-}
-
-// Extracts fst from packed pair
-static inline uint16_t heap_fst(uint16_t loc) {
-  return (uint16_t)heap[loc >> 1];
-}
-
-// Extracts snd from packed pair
-static inline uint16_t heap_snd(uint16_t loc) {
-  return (uint16_t)(heap[loc >> 1] >> 16);
-}
-
-// Writes packed pair
-static inline void heap_set(uint16_t loc, uint16_t fst, uint16_t snd) {
-  heap[loc >> 1] = ((uint32_t)snd << 16) | (uint32_t)fst;
-}
+// Reads fst/snd from a packed pair
+static inline uint16_t heap_fst(uint16_t l) { return (uint16_t)heap[l >> 1]; }
+static inline uint16_t heap_snd(uint16_t l) { return (uint16_t)(heap[l >> 1] >> 16); }
 
 // Allocates a 2-cell pair from the pre-seeded free list
 static inline uint16_t alloc2(void) {
@@ -71,9 +55,9 @@ static inline void free_pair(uint16_t loc) {
 
 // Allocates a tuple on the heap
 static inline uint16_t make_tup(uint16_t fst, uint16_t snd) {
-  uint16_t loc = alloc2();
-  heap_set(loc, fst, snd);
-  return MK(TAG_TUP, loc);
+  uint16_t l = alloc2();
+  heap[l >> 1] = ((uint32_t)snd << 16) | (uint32_t)fst;
+  return MK(TAG_TUP, l);
 }
 
 // Frees an unreferenced term tree (iterative on snd)
@@ -105,7 +89,6 @@ static void free_term(uint16_t p) {
 #define OP_MAT_BASE 0x20
 #define OP_MAT_MAX  0x8F
 #define OP_TUP_BASE 0x90
-#define OP_TUP_MAX  0xFF
 
 #define MAX_CODE 8192
 static uint8_t code[MAX_CODE];
@@ -122,10 +105,10 @@ static uint64_t stat_use = 0;
 
 // Sub Stack
 // ---------
-// Var(k) = sub_stack[sub_sp - 1 - k]. No zeroing on read (affine).
+// Var(k) = sub[sub_sp - 1 - k]. No zeroing on read (affine).
 
 #define MAX_SUB (1 << 12)
-static uint16_t sub_stack[MAX_SUB] __attribute__((aligned(64)));
+static uint16_t sub[MAX_SUB] __attribute__((aligned(64)));
 static uint32_t sub_sp = 0;
 
 // Cont Stack
@@ -137,12 +120,12 @@ static uint32_t sub_sp = 0;
 #define CONT_REC_FEED 3
 #define CONT_REC_DONE 4
 
-#define CONT_MAKE(tag, val) (((uint32_t)(tag) << 16) | ((uint32_t)(val) & 0xFFFF))
+#define CONT_MK(tag, val) (((uint32_t)(tag) << 16) | ((uint32_t)(val) & 0xFFFF))
 #define CONT_TAG(c)         ((c) >> 16)
 #define CONT_VAL(c)         ((uint16_t)((c) & 0xFFFF))
 
 #define MAX_CONT (1 << 12)
-static uint32_t cont_stack[MAX_CONT] __attribute__((aligned(64)));
+static uint32_t cont[MAX_CONT] __attribute__((aligned(64)));
 static uint32_t cont_sp = 0;
 
 // Feed Buffer
@@ -216,7 +199,7 @@ static char cname_buf[MAX_NAMES][32];
 static int  cname_used[MAX_NAMES];
 static int  cname_depth = 0;
 
-static void parse_name_into(Src *s, char *out, int maxlen) {
+static void parse_name(Src *s, char *out, int maxlen) {
   src_skip(s);
   int start = s->idx;
   while (s->idx < s->len && is_name_char(s->src[s->idx])) s->idx++;
@@ -311,7 +294,7 @@ static void compile_func(Src *s) {
       return;
     }
     char nm[32];
-    parse_name_into(s, nm, 32);
+    parse_name(s, nm, 32);
     src_expect(s, ".");
     uint32_t lam_pos = code_len;
     emit(0);
@@ -352,7 +335,7 @@ static void compile_term(Src *s) {
     s->idx++; emit(OP_BT1); return;
   }
   char nm[32];
-  parse_name_into(s, nm, 32);
+  parse_name(s, nm, 32);
   int dbi = find_name_dbi(nm);
   if (dbi < 0) { fprintf(stderr, "Unbound variable '%s'\n", nm); exit(1); }
   cname_used[cname_depth - 1 - dbi] = 1;
@@ -362,7 +345,7 @@ static void compile_term(Src *s) {
 // Disassembler
 // ------------
 
-static void print_code(uint32_t pc, int indent) {
+static void print_code(uint32_t pc) {
   uint8_t op = code[pc];
   if (op == OP_NUL) { printf("NUL"); return; }
   if (op == OP_BT0) { printf("BT0"); return; }
@@ -370,26 +353,26 @@ static void print_code(uint32_t pc, int indent) {
   if (op >= OP_VAR_BASE && op <= OP_VAR_MAX) {
     printf("VAR(%d)", op - OP_VAR_BASE); return;
   }
-  if (op == OP_LAM) { printf("LAM "); print_code(pc+1, indent); return; }
-  if (op == OP_ERA) { printf("ERA "); print_code(pc+1, indent); return; }
-  if (op == OP_USE) { printf("USE "); print_code(pc+1, indent); return; }
-  if (op == OP_GET) { printf("GET "); print_code(pc+1, indent); return; }
-  if (op == OP_REC) { printf("REC "); print_code(pc+1, indent); return; }
+  if (op == OP_LAM) { printf("LAM "); print_code(pc+1); return; }
+  if (op == OP_ERA) { printf("ERA "); print_code(pc+1); return; }
+  if (op == OP_USE) { printf("USE "); print_code(pc+1); return; }
+  if (op == OP_GET) { printf("GET "); print_code(pc+1); return; }
+  if (op == OP_REC) { printf("REC "); print_code(pc+1); return; }
   if (op >= OP_MAT_BASE && op <= OP_MAT_MAX) {
     uint32_t d = op - OP_MAT_BASE;
     printf("MAT(d=%u) {0: ", d);
-    print_code(pc+1, indent+2);
+    print_code(pc+1);
     printf("; 1: ");
-    print_code(pc+1+d, indent+2);
+    print_code(pc+1+d);
     printf("}");
     return;
   }
   if (op >= OP_TUP_BASE) {
     uint32_t d = op - OP_TUP_BASE;
     printf("TUP(d=%u) (", d);
-    print_code(pc+1, indent+2);
+    print_code(pc+1);
     printf(", ");
-    print_code(pc+1+d, indent+2);
+    print_code(pc+1+d);
     printf(")");
     return;
   }
@@ -400,23 +383,25 @@ static void print_code(uint32_t pc, int indent) {
 // -----------------
 // A REC argument is fusible if it's a flat TUP(d=1) chain with all leaf values.
 
+// A leaf is BT0, BT1, NUL, or VAR
+static inline int is_leaf(uint8_t op) {
+  return op == OP_BT0 || op == OP_BT1 || op == OP_NUL ||
+         (op >= OP_VAR_BASE && op <= OP_VAR_MAX);
+}
+
+// Checks if the REC argument at pc is fully fusible (all TUP(d=1) with leaves)
 static inline int is_fusible_arg(const uint8_t *cc, uint32_t pc) {
   while (cc[pc] == OP_TUP_BASE + 1) {
-    uint8_t f = cc[pc + 1];
-    if (!(f <= OP_VAR_MAX && f != OP_LAM && f != OP_USE && f != OP_GET &&
-          f != OP_REC && f != OP_ERA))
-      return 0;
+    if (!is_leaf(cc[pc + 1])) return 0;
     pc += 2;
   }
-  uint8_t s = cc[pc];
-  return s == OP_BT0 || s == OP_BT1 || s == OP_NUL ||
-         (s >= OP_VAR_BASE && s <= OP_VAR_MAX);
+  return is_leaf(cc[pc]);
 }
 
 // Feed
 // ----
 // Feeds a heap term into the program func at pc.
-// Pushes LAM bindings onto sub_stack. Returns pc of resulting body.
+// Pushes LAM bindings onto sub. Returns pc of resulting body.
 
 // Stats context — passed to feed so eval can keep counters in locals
 typedef struct { uint64_t fun, lam, mat, get, use; } Stats;
@@ -464,7 +449,7 @@ feed_term_ctx(uint32_t pc, uint16_t term, Stats *restrict st) {
     sub_sp    = sp;
     if (ctrl == FEED_LAM) {
       st->lam++;
-      sub_stack[sp++] = term;
+      sub[sp++] = term;
       sub_sp = sp;
       pc += 1;
       if (fsp == 0) return pc;
@@ -475,7 +460,7 @@ feed_term_ctx(uint32_t pc, uint16_t term, Stats *restrict st) {
       st->lam++;
       free_term(term);
       fh = free_head;
-      sub_stack[sp++] = 0;
+      sub[sp++] = 0;
       sub_sp = sp;
       pc += 1;
       if (fsp == 0) return pc;
@@ -542,14 +527,14 @@ static uint32_t feed_from_buf_ctx(uint32_t pc, uint16_t *buf,
     }
     if (ctrl == FEED_LAM) {
       st->lam++;
-      sub_stack[sub_sp++] = rebuild_from_buf(buf, bi, len, snd);
+      sub[sub_sp++] = rebuild_from_buf(buf, bi, len, snd);
       return pc + 1;
     }
     if (ctrl == FEED_ERA) {
       st->lam++;
       for (uint32_t i = bi; i < len; i++) free_term(buf[i]);
       free_term(snd);
-      sub_stack[sub_sp++] = 0;
+      sub[sub_sp++] = 0;
       return pc + 1;
     }
     if (ctrl == FEED_USE) {
@@ -590,16 +575,16 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
         else if (fst_op == OP_BT1) { fst_val = PTR_BT1; }
         else if (fst_op == OP_NUL) { fst_val = PTR_NUL; }
         else if (fst_op >= OP_VAR_BASE && fst_op <= OP_VAR_MAX) {
-          fst_val = sub_stack[sub_sp - 1 - (fst_op - OP_VAR_BASE)];
+          fst_val = sub[sub_sp - 1 - (fst_op - OP_VAR_BASE)];
         } else {
           goto tup_slow;
         }
-        cont_stack[csp++] = CONT_MAKE(CONT_TUP_DONE, fst_val);
+        cont[csp++] = CONT_MK(CONT_TUP_DONE, fst_val);
         pc += 2;
         goto eval;
       }
       tup_slow:
-      cont_stack[csp++] = CONT_MAKE(CONT_TUP_SND, pc + 1 + d);
+      cont[csp++] = CONT_MK(CONT_TUP_SND, pc + 1 + d);
       pc += 1;
       goto eval;
     }
@@ -607,12 +592,12 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
     if (op == OP_REC) {
       st.fun++;
       // Tail-call reuse: if top is REC_DONE, convert to REC_FEED
-      if (csp > 0 && CONT_TAG(cont_stack[csp - 1]) == CONT_REC_DONE) {
-        saved_sp = CONT_VAL(cont_stack[csp - 1]);
-        cont_stack[csp - 1] = CONT_MAKE(CONT_REC_FEED, saved_sp);
+      if (csp > 0 && CONT_TAG(cont[csp - 1]) == CONT_REC_DONE) {
+        saved_sp = CONT_VAL(cont[csp - 1]);
+        cont[csp - 1] = CONT_MK(CONT_REC_FEED, saved_sp);
       } else {
         saved_sp = sub_sp;
-        cont_stack[csp++] = CONT_MAKE(CONT_REC_FEED, sub_sp);
+        cont[csp++] = CONT_MK(CONT_REC_FEED, sub_sp);
       }
       // Eval-feed fusion: if arg is fusible, collect directly
       if (fusible[pc]) {
@@ -626,7 +611,7 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
     if (op == OP_BT0) { val = PTR_BT0; goto ret; }
     if (op == OP_BT1) { val = PTR_BT1; goto ret; }
     if (op >= OP_VAR_BASE) {
-      val = sub_stack[sub_sp - 1 - (op - OP_VAR_BASE)];
+      val = sub[sub_sp - 1 - (op - OP_VAR_BASE)];
       goto ret;
     }
     __builtin_unreachable();
@@ -639,7 +624,7 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
       stat_get = st.get; stat_use = st.use;
       return val;
     }
-    uint32_t c = cont_stack[csp - 1];
+    uint32_t c = cont[csp - 1];
 
     // Most common: TUP_DONE chain.
     // Collect fst values into local array INSTEAD of make_tup.
@@ -652,14 +637,14 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
         fsts[nf++] = CONT_VAL(c);
         csp--;
         if (__builtin_expect(csp > 0, 1)) {
-          c = cont_stack[csp - 1];
+          c = cont[csp - 1];
           if (__builtin_expect(CONT_TAG(c) == CONT_TUP_DONE, 1))
             continue;
           // Full deforestation: chain ended at REC_FEED
           if (CONT_TAG(c) == CONT_REC_FEED) {
             saved_sp = CONT_VAL(c);
             sub_sp   = saved_sp;
-            cont_stack[csp - 1] = CONT_MAKE(CONT_REC_DONE, saved_sp);
+            cont[csp - 1] = CONT_MK(CONT_REC_DONE, saved_sp);
             // fsts are in reverse order: [0]=innermost, [nf-1]=outermost
             // Inline first GET+MAT with outermost fst
             st.get++;
@@ -690,7 +675,7 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
             }
             if (cc[body_pc] == OP_REC) {
               st.fun++;
-              cont_stack[csp - 1] = CONT_MAKE(CONT_REC_FEED, saved_sp);
+              cont[csp - 1] = CONT_MK(CONT_REC_FEED, saved_sp);
               pc = body_pc + 1;
             } else {
               pc = body_pc;
@@ -708,7 +693,7 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
 
     // TUP_SND: fst evaluated, now eval snd
     if (CONT_TAG(c) == CONT_TUP_SND) {
-      cont_stack[csp - 1] = CONT_MAKE(CONT_TUP_DONE, val);
+      cont[csp - 1] = CONT_MK(CONT_TUP_DONE, val);
       pc = CONT_VAL(c);
       goto eval;
     }
@@ -717,7 +702,7 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
     if (CONT_TAG(c) == CONT_REC_FEED) {
       saved_sp = CONT_VAL(c);
       sub_sp   = saved_sp;
-      cont_stack[csp - 1] = CONT_MAKE(CONT_REC_DONE, saved_sp);
+      cont[csp - 1] = CONT_MK(CONT_REC_DONE, saved_sp);
       goto post_feed;
     }
 
@@ -764,7 +749,7 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
       }
       if (cc[body_pc] == OP_REC) {
         st.fun++;
-        cont_stack[csp - 1] = CONT_MAKE(CONT_REC_FEED, saved_sp);
+        cont[csp - 1] = CONT_MK(CONT_REC_FEED, saved_sp);
         pc = body_pc + 1;
       } else {
         pc = body_pc;
@@ -786,7 +771,7 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
         else if (fst_op == OP_BT1) { fst_val = PTR_BT1; }
         else if (fst_op == OP_NUL) { fst_val = PTR_NUL; }
         else if (fst_op >= OP_VAR_BASE && fst_op <= OP_VAR_MAX) {
-          fst_val = sub_stack[sub_sp - 1 - (fst_op - OP_VAR_BASE)];
+          fst_val = sub[sub_sp - 1 - (fst_op - OP_VAR_BASE)];
         } else {
           goto eval_rec_arg_fallback;
         }
@@ -800,14 +785,14 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
       else if (op == OP_BT1) { snd_val = PTR_BT1; }
       else if (op == OP_NUL) { snd_val = PTR_NUL; }
       else if (op >= OP_VAR_BASE && op <= OP_VAR_MAX) {
-        snd_val = sub_stack[sub_sp - 1 - (op - OP_VAR_BASE)];
+        snd_val = sub[sub_sp - 1 - (op - OP_VAR_BASE)];
       } else {
         goto eval_rec_arg_fallback;
       }
       // Feed buffer + snd into program (inline two GET+MAT levels)
       {
         sub_sp = saved_sp;
-        cont_stack[csp - 1] = CONT_MAKE(CONT_REC_DONE, saved_sp);
+        cont[csp - 1] = CONT_MK(CONT_REC_DONE, saved_sp);
         st.get++;
         st.mat++;
         uint16_t ifst = feed_buf[0];
@@ -835,7 +820,7 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
             feed_bi = 0;
             goto eval_rec_arg_collect;
           }
-          cont_stack[csp - 1] = CONT_MAKE(CONT_REC_FEED, saved_sp);
+          cont[csp - 1] = CONT_MK(CONT_REC_FEED, saved_sp);
           pc = body_pc + 1;
           goto eval;
         }
@@ -847,7 +832,7 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
     eval_rec_arg_fallback: {
       // Not fusible — push remaining as CONT_TUP_DONEs, resume normal eval
       for (uint32_t i = 0; i < feed_bi; i++)
-        cont_stack[csp++] = CONT_MAKE(CONT_TUP_DONE, feed_buf[i]);
+        cont[csp++] = CONT_MK(CONT_TUP_DONE, feed_buf[i]);
       goto eval;
     }
   }
@@ -955,7 +940,7 @@ int main(int argc, char **argv) {
   }
 
   printf("Bytecode (%u bytes): ", code_len);
-  print_code(0, 0);
+  print_code(0);
   printf("\n");
 
   // Build n = 44 one-bits (LSB-first): (1,(1,...(0,())))
