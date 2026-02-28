@@ -3,7 +3,8 @@
 // Fast C runtime for LamBit. ~1B interactions/s with PGO+LTO.
 // Packed u32 heap, precomputed feed dispatch, localized free-list,
 // eval-feed fusion, tail-call reuse, full deforestation.
-// Compile: gcc -O3 -march=native -o lambit_opus lambit_opus.c
+// Compile: clang -O3 -march=native -fno-stack-protector -fomit-frame-pointer
+//          -flto -mllvm -unroll-count=4 -o lambit_opus lambit_opus.c
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,7 +63,7 @@ static inline uint16_t make_tup(uint16_t fst, uint16_t snd) {
 }
 
 // Frees an unreferenced term tree (iterative on snd)
-static void free_term(uint16_t p) {
+static __attribute__((noinline)) void free_term(uint16_t p) {
   while (p >= 0xC000) {
     uint16_t loc = LOC(p);
     uint32_t pair = heap[loc >> 1];
@@ -407,7 +408,7 @@ static inline int is_fusible_arg(const uint8_t *cc, uint32_t pc) {
 typedef struct { uint64_t fun, lam, mat, get, use; } Stats;
 
 // Fully iterative feed with stats context (uses precomputed FeedSuper table)
-static __attribute__((hot)) uint32_t
+static __attribute__((hot, always_inline)) uint32_t
 feed_term_ctx(uint32_t pc, uint16_t term, Stats *restrict st) {
   uint16_t fstk[32];
   uint32_t fsp   = 0;
@@ -415,9 +416,12 @@ feed_term_ctx(uint32_t pc, uint16_t term, Stats *restrict st) {
   uint32_t sp    = sub_sp;
   const uint16_t *fs = feed_sup;
   for (;;) {
-    uint16_t entry = fs[pc];
-    uint8_t  ctrl  = FEED_CTRL(entry);
-    if (__builtin_expect(ctrl == FEED_GET_MAT, 1)) {
+    // Tight GET_MAT loop: only pc, term, fh, stats live
+    for (;;) {
+      uint16_t entry = fs[pc];
+      uint8_t  ctrl  = FEED_CTRL(entry);
+      if (__builtin_expect(ctrl != FEED_GET_MAT, 0))
+        break;
       st->get++;
       st->mat++;
       uint16_t loc  = LOC(term);
@@ -429,8 +433,9 @@ feed_term_ctx(uint32_t pc, uint16_t term, Stats *restrict st) {
       uint32_t d = FEED_DELTA(entry);
       pc   = (fst == PTR_BT0) ? pc + 2 : pc + 2 + d;
       term = snd;
-      continue;
     }
+    uint16_t entry = fs[pc];
+    uint8_t  ctrl  = FEED_CTRL(entry);
     if (ctrl == FEED_GET) {
       st->get++;
       uint16_t loc  = LOC(term);
@@ -493,8 +498,9 @@ static uint32_t feed_term(uint32_t pc, uint16_t term) {
 }
 
 // Rebuilds a heap tuple from buf[bi..len-1] + snd (bottom-up)
-static uint16_t rebuild_from_buf(uint16_t *buf, uint32_t bi,
-                                 uint32_t len, uint16_t snd) {
+static __attribute__((always_inline)) uint16_t
+rebuild_from_buf(uint16_t *buf, uint32_t bi,
+                 uint32_t len, uint16_t snd) {
   uint16_t val = snd;
   for (int i = (int)len - 1; i >= (int)bi; i--)
     val = make_tup(buf[i], val);
@@ -502,9 +508,10 @@ static uint16_t rebuild_from_buf(uint16_t *buf, uint32_t bi,
 }
 
 // Feeds from buffer instead of heap (no alloc, no free for dispatch)
-static uint32_t feed_from_buf_ctx(uint32_t pc, uint16_t *buf,
-                                  uint32_t bi, uint32_t len,
-                                  uint16_t snd, Stats *restrict st) {
+static __attribute__((always_inline)) uint32_t
+feed_from_buf_ctx(uint32_t pc, uint16_t *buf,
+                  uint32_t bi, uint32_t len,
+                  uint16_t snd, Stats *restrict st) {
   const uint16_t *fs = feed_sup;
   for (;;) {
     if (bi >= len)
