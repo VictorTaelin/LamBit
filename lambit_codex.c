@@ -205,10 +205,10 @@ static uint32_t PROG_PC = 0;
 static bool PROG_TOP_GET = false;
 static bool PROG_TOP_GET_MAT = false;
 static uint32_t PROG_TOP_MAT_DELTA = 0;
-static Ptr SUB_STACK[MAX_SUB];
+static Ptr SUB_STACK[MAX_SUB] __attribute__((aligned(64)));
 static uint32_t SUB_SP = 0;
-static Ptr FEED_STACK[MAX_FEED];
-static Cont EVAL_CONT_STACK[MAX_EVAL];
+static Ptr FEED_STACK[MAX_FEED] __attribute__((aligned(64)));
+static Cont EVAL_CONT_STACK[MAX_EVAL] __attribute__((aligned(64)));
 
 static void die(const char* fmt, ...) {
   va_list ap;
@@ -645,9 +645,9 @@ uint32_t feed_term(
   uint64_t* restrict app_get_p,
   uint64_t* restrict app_use_p
 ) {
-  uint32_t feed_sp = 0;
+  Ptr* const feed_base = FEED_STACK;
+  Ptr* feed_top = feed_base;
   uint32_t sub_sp = *sub_sp_p;
-  Ptr* restrict feed_stack = FEED_STACK;
   Ptr* restrict sub_stack = SUB_STACK;
   const uint8_t* cc = PROG_CODE->buf;
   uint64_t app_lam = *app_lam_p;
@@ -660,7 +660,7 @@ uint32_t feed_term(
 
     if (LIKELY(op == OP_GET)) {
       HOT_ASSERT(PTR_TAG(arg) == CTR_TUP, "Get expected tuple.");
-      HOT_ASSERT(feed_sp < MAX_FEED, "Feed stack overflow.");
+      HOT_ASSERT(feed_top < feed_base + MAX_FEED, "Feed stack overflow.");
 #if LAMBIT_COUNT_STATS
       app_get++;
 #endif
@@ -681,7 +681,7 @@ uint32_t feed_term(
         continue;
       }
 
-      feed_stack[feed_sp++] = b;
+      *feed_top++ = b;
       pc = pc + 1;
       arg = a;
       continue;
@@ -694,8 +694,8 @@ uint32_t feed_term(
       HOT_ASSERT(sub_sp < MAX_SUB, "Substitution stack overflow.");
       sub_stack[sub_sp++] = arg;
       pc = pc + 1;
-      if (feed_sp == 0) break;
-      arg = feed_stack[--feed_sp];
+      if (feed_top == feed_base) break;
+      arg = *--feed_top;
       continue;
     }
 
@@ -705,8 +705,8 @@ uint32_t feed_term(
       app_use++;
 #endif
       pc = pc + 1;
-      if (feed_sp == 0) break;
-      arg = feed_stack[--feed_sp];
+      if (feed_top == feed_base) break;
+      arg = *--feed_top;
       continue;
     }
 
@@ -720,8 +720,8 @@ uint32_t feed_term(
       }
       sub_stack[sub_sp++] = PTR_NUL;
       pc = pc + 1;
-      if (feed_sp == 0) break;
-      arg = feed_stack[--feed_sp];
+      if (feed_top == feed_base) break;
+      arg = *--feed_top;
       continue;
     }
 
@@ -732,8 +732,8 @@ uint32_t feed_term(
 #endif
       uint32_t d = (uint32_t)(op - OP_MAT);
       pc = (arg == PTR_BT0) ? (pc + 1) : (pc + 1 + d);
-      if (feed_sp == 0) break;
-      arg = feed_stack[--feed_sp];
+      if (feed_top == feed_base) break;
+      arg = *--feed_top;
       continue;
     }
 
