@@ -280,385 +280,7 @@ please rewrite the full program again below to do just that:
 */
 
 /*
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <stdalign.h>
-
-// Pointers
-#define PTR_TUP 0x0000
-#define PTR_NUL 0x4000
-#define PTR_BT0 0x8000
-#define PTR_BT1 0xC000
-
-// Memory and GC
-alignas(64) uint16_t heap[16384];
-uint16_t K = 2;
-
-// Allocation profiling counters
-uint64_t alloc_calls = 0;
-uint64_t alloc_scans = 0;
-uint64_t free_calls = 0;
-uint16_t max_K_seen = 0;
-
-static inline uint16_t alloc(uint16_t fst, uint16_t snd) {
-    alloc_calls++;
-    while (heap[K] != 0) {
-        alloc_scans++;
-        K = (K + 2) & 0x3FFF;
-        if (K == 0) K = 2;
-    }
-    if (K > max_K_seen) max_K_seen = K;
-    heap[K] = fst;
-    heap[K+1] = snd;
-    uint16_t loc = K;
-    K = (K + 2) & 0x3FFF;
-    if (K == 0) K = 2;
-    return loc;
-}
-
-static inline void free_term(uint16_t ptr) {
-    while (ptr < 0x4000) { // TUP
-        free_calls++;
-        uint16_t fst = heap[ptr];
-        uint16_t snd = heap[ptr+1];
-        heap[ptr] = 0;
-        heap[ptr+1] = 0;
-        if (fst < 0x4000) free_term(fst);
-        ptr = snd;
-    }
-}
-
-// Runtime State
-typedef struct {
-    uint32_t app_fun, app_lam, app_mat, app_get, app_use;
-} Stats;
-
-uint8_t prog[4096];
-uint32_t prog_len = 0;
-Stats stats = {0};
-
-char names[24][16];
-int name_count = 0;
-
-int find_name(const char* name) {
-    for (int i = name_count - 1; i >= 0; i--) {
-        if (strcmp(names[i], name) == 0) return i;
-    }
-    return -1;
-}
-
-// Parser
-void skip_ws(const char* src, uint32_t* idx) {
-    while (src[*idx] == ' ' || src[*idx] == '\n' || src[*idx] == '\t' || src[*idx] == '\r') {
-        (*idx)++;
-    }
-}
-
-bool match_str(const char* src, uint32_t* idx, const char* str) {
-    skip_ws(src, idx);
-    uint32_t len = strlen(str);
-    if (strncmp(src + *idx, str, len) == 0) {
-        *idx += len;
-        return true;
-    }
-    return false;
-}
-
-void expect_str(const char* src, uint32_t* idx, const char* str) {
-    if (!match_str(src, idx, str)) {
-        printf("Expected '%s' at index %u\n", str, *idx);
-        exit(1);
-    }
-}
-
-void parse_name_str(const char* src, uint32_t* idx, char* out) {
-    skip_ws(src, idx);
-    int len = 0;
-    while (src[*idx] && strchr("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789", src[*idx])) {
-        out[len++] = src[(*idx)++];
-    }
-    out[len] = '\0';
-}
-
-bool is_bt(const char* src, uint32_t* idx, char c) {
-    skip_ws(src, idx);
-    if (src[*idx] == c) {
-        char next = src[*idx+1];
-        if ((next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') || (next >= '0' && next <= '9') || next == '_' || next == '{') {
-            return false;
-        }
-        return true;
-    }
-    return false;
-}
-
-void parse_term_src(const char* src, uint32_t* idx);
-
-void parse_func_src(const char* src, uint32_t* idx) {
-    skip_ws(src, idx);
-    if (match_str(src, idx, "λ!")) {
-        prog[prog_len++] = 0x05;
-        parse_func_src(src, idx);
-        return;
-    }
-    if (match_str(src, idx, "λ")) {
-        if (match_str(src, idx, "{")) {
-            expect_str(src, idx, "0"); expect_str(src, idx, ":");
-            uint32_t op_pos = prog_len++;
-            parse_func_src(src, idx);
-            match_str(src, idx, ";");
-            expect_str(src, idx, "1"); expect_str(src, idx, ":");
-            uint32_t delta = prog_len - (op_pos + 1);
-            prog[op_pos] = 0x20 + delta;
-            parse_func_src(src, idx);
-            match_str(src, idx, ";");
-            expect_str(src, idx, "}");
-            return;
-        }
-        if (match_str(src, idx, "()")) {
-            expect_str(src, idx, ".");
-            prog[prog_len++] = 0x04;
-            parse_func_src(src, idx);
-            return;
-        }
-        char name[16];
-        parse_name_str(src, idx, name);
-        expect_str(src, idx, ".");
-        strcpy(names[name_count++], name);
-        prog[prog_len++] = 0x03;
-        parse_func_src(src, idx);
-        name_count--;
-        return;
-    }
-    prog[prog_len++] = 0x06;
-    parse_term_src(src, idx);
-}
-
-void parse_term_src(const char* src, uint32_t* idx) {
-    skip_ws(src, idx);
-    if (match_str(src, idx, "~")) {
-        prog[prog_len++] = 0x07;
-        parse_term_src(src, idx);
-        return;
-    }
-    if (src[*idx] == '(' && src[*idx+1] == ')') {
-        *idx += 2;
-        prog[prog_len++] = 0x00;
-        return;
-    }
-    if (src[*idx] == '(') {
-        match_str(src, idx, "(");
-        uint32_t op_pos = prog_len++;
-        parse_term_src(src, idx);
-        expect_str(src, idx, ",");
-        uint32_t delta = prog_len - (op_pos + 1);
-        prog[op_pos] = 0x90 + delta;
-        parse_term_src(src, idx);
-        expect_str(src, idx, ")");
-        return;
-    }
-    if (is_bt(src, idx, '0')) {
-        (*idx)++;
-        prog[prog_len++] = 0x01;
-        return;
-    }
-    if (is_bt(src, idx, '1')) {
-        (*idx)++;
-        prog[prog_len++] = 0x02;
-        return;
-    }
-    char name[16];
-    parse_name_str(src, idx, name);
-    int var_idx = find_name(name);
-    if (var_idx == -1) {
-        printf("Unbound variable '%s'\n", name);
-        exit(1);
-    }
-    prog[prog_len++] = 0x08 + var_idx;
-}
-
-// Evaluator
-typedef uint64_t u64;
-
-static inline u64 feed(uint32_t pc, uint16_t term, uint16_t* ctx, uint32_t level) {
-    uint8_t op = prog[pc++];
-    switch (op) {
-        case 0x05: { // Get
-            stats.app_get++;
-            uint16_t fst = heap[term];
-            uint16_t snd = heap[term+1];
-            heap[term] = 0;
-            heap[term+1] = 0;
-            u64 res = feed(pc, fst, ctx, level);
-            return feed((uint32_t)res, snd, ctx, (uint32_t)(res >> 32));
-        }
-        case 0x03: { // Lam
-            stats.app_lam++;
-            ctx[level++] = term;
-            break;
-        }
-        case 0x04: { // Use
-            stats.app_use++;
-            break;
-        }
-        default: { // Mat (0x20 to 0x8F)
-            stats.app_mat++;
-            if (term == PTR_BT1) {
-                pc += (op - 0x20);
-            }
-            break;
-        }
-    }
-    return ((u64)level << 32) | pc;
-}
-
-static inline u64 eval_term(uint32_t pc, uint16_t* ctx);
-
-static inline uint16_t eval_app(uint16_t arg) {
-    uint16_t ctx[24];
-
-    while (1) {
-        u64 feed_res = feed(0, arg, ctx, 0);
-        uint32_t pc = (uint32_t)feed_res;
-        uint32_t level = (uint32_t)(feed_res >> 32);
-
-        pc++; // skip 0x06 (Ret)
-
-        if (prog[pc] == 0x07) { // Tail Rec
-            pc++;
-            stats.app_fun++;
-            u64 term_res = eval_term(pc, ctx);
-            uint16_t next_arg = (uint16_t)term_res;
-
-            for (uint32_t i = 0; i < level; i++) {
-                if (ctx[i]) { free_term(ctx[i]); ctx[i] = 0; }
-            }
-            arg = next_arg;
-        } else {
-            u64 term_res = eval_term(pc, ctx);
-            uint16_t res = (uint16_t)term_res;
-
-            for (uint32_t i = 0; i < level; i++) {
-                if (ctx[i]) free_term(ctx[i]);
-            }
-            return res;
-        }
-    }
-}
-
-static inline u64 eval_term(uint32_t pc, uint16_t* ctx) {
-    uint8_t op = prog[pc++];
-    switch (op) {
-        case 0x00: return ((u64)pc << 32) | PTR_NUL;
-        case 0x01: return ((u64)pc << 32) | PTR_BT0;
-        case 0x02: return ((u64)pc << 32) | PTR_BT1;
-        case 0x07: { // Rec
-            stats.app_fun++;
-            u64 res = eval_term(pc, ctx);
-            return ((res & 0xFFFFFFFF00000000ULL) | eval_app((uint16_t)res));
-        }
-        default:
-            if (op < 0x20) { // Var
-                uint8_t idx = op - 0x08;
-                uint16_t val = ctx[idx];
-                ctx[idx] = 0;
-                return ((u64)pc << 32) | val;
-            } else { // Tup
-                u64 left = eval_term(pc, ctx);
-                u64 right = eval_term((uint32_t)(left >> 32), ctx);
-                return (right & 0xFFFFFFFF00000000ULL) | alloc((uint16_t)left, (uint16_t)right);
-            }
-    }
-}
-
-// Show
-void show_term(uint16_t ptr) {
-    if (ptr == PTR_NUL) {
-        printf("()");
-    } else if (ptr == PTR_BT0) {
-        printf("0");
-    } else if (ptr == PTR_BT1) {
-        printf("1");
-    } else if ((ptr >> 14) == 0) {
-        printf("(");
-        show_term(heap[ptr]);
-        printf(",");
-        show_term(heap[ptr+1]);
-        printf(")");
-    }
-}
-
-int main() {
-    const char* prog_src = "λ! λ{\n"
-    "    0: λ! λ{\n"
-    "      0: λx. ~(0,(1,(~(1,(1,x)),(0,()))))\n"
-    "      1: λ! λ! λ{\n"
-    "        0: λ(). λzs. zs\n"
-    "        1: λ! λ{\n"
-    "          0: λxs. λzs. ~(0,(1,(xs,(1,(0,zs)))))\n"
-    "          1: λxs. λzs. ~(0,(0,~(1,(0,(zs,(1,(1,xs)))))))\n"
-    "        }\n"
-    "      }\n"
-    "    }\n"
-    "    1: λ! λ{\n"
-    "      0: λ! λ! λ{\n"
-    "        0: λ(). λys. ys\n"
-    "        1: λ! λx. λxs. λys. (1,(x,~(1,(0,(xs,ys)))))\n"
-    "      }\n"
-    "      1: λ! λ{\n"
-    "        0: λ(). (0,())\n"
-    "        1: λ! λ{\n"
-    "          0: λxs. (1,(1,~(1,(1,xs))))\n"
-    "          1: λxs. (1,(0,xs))\n"
-    "        }\n"
-    "      }\n"
-    "    }\n"
-    "  }";
-
-    uint32_t idx = 0;
-    parse_func_src(prog_src, &idx);
-
-    char n_buf[1024];
-    strcpy(n_buf, "(0,())");
-    for (int i = 0; i < 22; i++) {
-        char temp[1024];
-        sprintf(temp, "(1,(1,%s))", n_buf);
-        strcpy(n_buf, temp);
-    }
-    char input_src[1024];
-    sprintf(input_src, "~(0,(0,%s))", n_buf);
-
-    uint32_t input_idx = 0;
-    uint32_t input_pc = prog_len;
-    parse_term_src(input_src, &input_idx);
-
-    uint16_t dummy_ctx[24] = {0};
-    u64 res = eval_term(input_pc, dummy_ctx);
-    uint16_t result = (uint16_t)res;
-
-    show_term(result);
-    printf("\n");
-    uint32_t total = stats.app_fun + stats.app_lam + stats.app_mat + stats.app_get + stats.app_use;
-    printf("Interactions: %u\n", total);
-    printf("- APP-FUN: %u\n", stats.app_fun);
-    printf("- APP-LAM: %u\n", stats.app_lam);
-    printf("- APP-MAT: %u\n", stats.app_mat);
-    printf("- APP-GET: %u\n", stats.app_get);
-    printf("- APP-USE: %u\n", stats.app_use);
-
-    printf("\nAllocation profiling:\n");
-    printf("- alloc calls:      %llu\n", alloc_calls);
-    printf("- alloc scans:      %llu\n", alloc_scans);
-    printf("- scans/alloc:      %.4f\n", alloc_calls > 0 ? (double)alloc_scans / alloc_calls : 0.0);
-    printf("- free_term calls:  %llu\n", free_calls);
-    printf("- max K seen:       %u (of 16384 slots = %.2f%% fill)\n", max_K_seen, (double)max_K_seen / 16384.0 * 100.0);
-
-    return 0;
-}
-
+(omitted)
 
 so, this is what I got:
 
@@ -1254,7 +876,6 @@ be way more aggressive with your optimizations.
 rethink the architecture from scratch if needed.
 use every technique you can think of.
 
-this is your final chance.
 rethink the entire approach from scratch.
 
 */
@@ -1715,4 +1336,1145 @@ We finally dropped the `switch(op)`. A `switch` statement forces all bytecode ex
 Notice the `tail_call:` label at the top of `eval_app`. When the interpreter hits `OP_TAIL_REC`, it doesn't make a recursive C function call. It simply swaps the `arg` variable, resets the stack pointers, and jumps back to the top (`goto tail_call;`). Your multi-million interaction functional program is now executing as a single, flat CPU loop.
 
 By combining an L1-pinned packed heap, a postfix stack machine, and threaded direct dispatch, the C interpreter is now functioning almost exactly like raw, custom-tailored assembly code.
+
+---
+
+I see. This is actually incredible - good job.
+
+keep working towards 1m. for this turn, i provided you with codex's and claude's take. both achieve nearly 700m. perhaps some of their optimizations will help you.
+
 */
+
+/*
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdalign.h>
+
+// Pointers
+#define PTR_TUP 0x0000
+#define PTR_NUL 0x4000
+#define PTR_BT0 0x8000
+#define PTR_BT1 0xC000
+
+// Memory and GC: Dense packed 32-bit heap & O(1) freelist allocator
+alignas(64) uint32_t heap[16384]; 
+uint32_t freelist[16384];
+uint32_t free_sp = 0;
+uint32_t K = 1; // 0 is invalid
+
+// Allocation profiling counters
+uint64_t alloc_calls = 0;
+uint64_t alloc_scans = 0; // Pure freelist -> 0 scans
+uint64_t free_calls = 0;
+uint32_t max_K_seen = 0;
+
+static inline uint32_t alloc(uint32_t fst, uint32_t snd) {
+    alloc_calls++;
+    uint32_t loc;
+    if (free_sp > 0) {
+        loc = freelist[--free_sp];
+    } else {
+        loc = K++;
+        if (loc > max_K_seen) max_K_seen = loc;
+    }
+    heap[loc] = fst | (snd << 16);
+    return loc;
+}
+
+static inline void free_loc(uint32_t loc) {
+    free_calls++;
+    freelist[free_sp++] = loc;
+}
+
+// Runtime State
+typedef struct {
+    uint32_t app_fun, app_lam, app_mat, app_get, app_use;
+} Stats;
+
+enum {
+    OP_DONE = 0,
+    OP_GET, OP_LAM, OP_USE, OP_MAT, OP_START_EVAL,
+    OP_NUL, OP_BT0, OP_BT1, OP_VAR, OP_TUP, OP_REC, OP_TAIL_REC, OP_END
+};
+
+uint16_t prog[4096];
+uint32_t prog_len = 0;
+Stats stats = {0};
+
+char names[24][16];
+int name_count = 0;
+
+int find_name(const char* name) {
+    for (int i = name_count - 1; i >= 0; i--) {
+        if (strcmp(names[i], name) == 0) return i;
+    }
+    return -1;
+}
+
+// Parser
+void skip_ws(const char* src, uint32_t* idx) {
+    while (src[*idx] == ' ' || src[*idx] == '\n' || src[*idx] == '\t' || src[*idx] == '\r') (*idx)++;
+}
+
+bool match_str(const char* src, uint32_t* idx, const char* str) {
+    skip_ws(src, idx);
+    uint32_t len = strlen(str);
+    if (strncmp(src + *idx, str, len) == 0) {
+        *idx += len;
+        return true;
+    }
+    return false;
+}
+
+void expect_str(const char* src, uint32_t* idx, const char* str) {
+    if (!match_str(src, idx, str)) {
+        printf("Expected '%s' at index %u\n", str, *idx);
+        exit(1);
+    }
+}
+
+void parse_name_str(const char* src, uint32_t* idx, char* out) {
+    skip_ws(src, idx);
+    int len = 0;
+    while (src[*idx] && strchr("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789", src[*idx])) {
+        out[len++] = src[(*idx)++];
+    }
+    out[len] = '\0';
+}
+
+bool is_bt(const char* src, uint32_t* idx, char c) {
+    skip_ws(src, idx);
+    if (src[*idx] == c) {
+        char next = src[*idx+1];
+        if ((next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') || (next >= '0' && next <= '9') || next == '_' || next == '{') {
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+void parse_term_src(const char* src, uint32_t* idx);
+
+void parse_func_src(const char* src, uint32_t* idx) {
+    skip_ws(src, idx);
+    if (match_str(src, idx, "λ!")) {
+        prog[prog_len++] = OP_GET;
+        parse_func_src(src, idx);
+        return;
+    }
+    if (match_str(src, idx, "λ")) {
+        if (match_str(src, idx, "{")) {
+            expect_str(src, idx, "0"); expect_str(src, idx, ":");
+            uint32_t op_pos = prog_len;
+            prog[prog_len++] = OP_MAT;
+            prog[prog_len++] = 0; 
+            parse_func_src(src, idx);
+            match_str(src, idx, ";");
+            expect_str(src, idx, "1"); expect_str(src, idx, ":");
+            prog[op_pos + 1] = prog_len - (op_pos + 2);
+            parse_func_src(src, idx);
+            match_str(src, idx, ";");
+            expect_str(src, idx, "}");
+            return;
+        }
+        if (match_str(src, idx, "()")) {
+            expect_str(src, idx, ".");
+            prog[prog_len++] = OP_USE;
+            parse_func_src(src, idx);
+            return;
+        }
+        char name[16];
+        parse_name_str(src, idx, name);
+        expect_str(src, idx, ".");
+        strcpy(names[name_count++], name);
+        prog[prog_len++] = OP_LAM;
+        parse_func_src(src, idx);
+        name_count--;
+        return;
+    }
+    prog[prog_len++] = OP_START_EVAL;
+    skip_ws(src, idx);
+    if (match_str(src, idx, "~")) {
+        parse_term_src(src, idx);
+        prog[prog_len++] = OP_TAIL_REC;
+    } else {
+        parse_term_src(src, idx);
+        prog[prog_len++] = OP_END;
+    }
+}
+
+void parse_term_src(const char* src, uint32_t* idx) {
+    skip_ws(src, idx);
+    if (match_str(src, idx, "~")) {
+        parse_term_src(src, idx);
+        prog[prog_len++] = OP_REC;
+        return;
+    }
+    if (src[*idx] == '(' && src[*idx+1] == ')') {
+        *idx += 2;
+        prog[prog_len++] = OP_NUL;
+        return;
+    }
+    if (src[*idx] == '(') {
+        match_str(src, idx, "(");
+        parse_term_src(src, idx); 
+        expect_str(src, idx, ",");
+        parse_term_src(src, idx); 
+        expect_str(src, idx, ")");
+        prog[prog_len++] = OP_TUP;
+        return;
+    }
+    if (is_bt(src, idx, '0')) {
+        (*idx)++;
+        prog[prog_len++] = OP_BT0;
+        return;
+    }
+    if (is_bt(src, idx, '1')) {
+        (*idx)++;
+        prog[prog_len++] = OP_BT1;
+        return;
+    }
+    char name[16];
+    parse_name_str(src, idx, name);
+    int var_idx = find_name(name);
+    if (var_idx == -1) {
+        printf("Unbound variable '%s'\n", name);
+        exit(1);
+    }
+    prog[prog_len++] = OP_VAR;
+    prog[prog_len++] = var_idx;
+}
+
+static void** dispatch_table;
+static uint32_t ctx[1024 * 24];
+static uint32_t val_stack[4096];
+static uint32_t term_stack[4096];
+static void** call_stack_pc[1024];
+static uint32_t call_stack_ctx[1024];
+
+static uint32_t eval_app(uint32_t arg, void** prog_start) {
+    if (__builtin_expect(prog_start == NULL, 0)) {
+        static const void* dispatch[] = {
+            &&L_END,         // 0
+            &&L_GET,         // 1
+            &&L_LAM,         // 2
+            &&L_USE,         // 3
+            &&L_MAT,         // 4
+            &&L_START_EVAL,  // 5
+            &&L_NUL,         // 6
+            &&L_BT0,         // 7
+            &&L_BT1,         // 8
+            &&L_VAR,         // 9
+            &&L_TUP,         // 10
+            &&L_REC,         // 11
+            &&L_TAIL_REC,    // 12
+            &&L_END          // 13
+        };
+        dispatch_table = (void**)dispatch;
+        return 0;
+    }
+
+    uint32_t ctx_sp = 0;
+    uint32_t val_sp = 0;
+    uint32_t term_sp = 0;
+    uint32_t call_sp = 0;
+
+    void** pc;
+    uint32_t level;
+    uint32_t term;
+
+tail_call:
+    pc = prog_start;
+    level = 0;
+    term = arg;
+    goto **pc++;
+
+L_GET:
+    stats.app_get++;
+    {
+        uint32_t val = heap[term];
+        free_loc(term);
+        term_stack[term_sp++] = val >> 16;
+        term = val & 0xFFFF;
+    }
+    goto **pc++;
+
+L_LAM:
+    stats.app_lam++;
+    ctx[ctx_sp + level++] = term;
+    if (term_sp) term = term_stack[--term_sp];
+    goto **pc++;
+
+L_USE:
+    stats.app_use++;
+    if (term_sp) term = term_stack[--term_sp];
+    goto **pc++;
+
+L_MAT:
+    stats.app_mat++;
+    {
+        intptr_t delta = (intptr_t)(*pc++);
+        if (term == PTR_BT1) pc += delta;
+    }
+    if (term_sp) term = term_stack[--term_sp];
+    goto **pc++;
+
+L_START_EVAL:
+    goto **pc++;
+
+L_NUL: 
+    val_stack[val_sp++] = PTR_NUL; 
+    goto **pc++;
+
+L_BT0: 
+    val_stack[val_sp++] = PTR_BT0; 
+    goto **pc++;
+
+L_BT1: 
+    val_stack[val_sp++] = PTR_BT1; 
+    goto **pc++;
+
+L_VAR:
+    val_stack[val_sp++] = ctx[ctx_sp + (uintptr_t)(*pc++)];
+    goto **pc++;
+
+L_TUP:
+    {
+        uint32_t right = val_stack[val_sp - 1];
+        uint32_t left  = val_stack[val_sp - 2];
+        val_stack[val_sp - 2] = alloc(left, right);
+        val_sp--;
+    }
+    goto **pc++;
+
+L_REC:
+    stats.app_fun++;
+    {
+        uint32_t rec_arg = val_stack[--val_sp];
+        call_stack_pc[call_sp] = pc;
+        call_stack_ctx[call_sp] = ctx_sp;
+        call_sp++;
+        
+        ctx_sp += 24;
+        
+        arg = rec_arg;
+        goto tail_call;
+    }
+
+L_TAIL_REC:
+    stats.app_fun++;
+    arg = val_stack[--val_sp];
+    goto tail_call;
+
+L_END:
+    {
+        uint32_t res = val_stack[--val_sp];
+        if (call_sp == 0) return res;
+        
+        call_sp--;
+        pc = call_stack_pc[call_sp];
+        ctx_sp = call_stack_ctx[call_sp];
+        
+        val_stack[val_sp++] = res;
+    }
+    goto **pc++;
+}
+
+void* compiled_prog[4096];
+
+void compile_prog() {
+    eval_app(0, NULL);
+    for (uint32_t i = 0; i < prog_len; i++) {
+        if (prog[i] == OP_MAT || prog[i] == OP_VAR) {
+            compiled_prog[i] = dispatch_table[prog[i]];
+            compiled_prog[i+1] = (void*)(uintptr_t)prog[i+1];
+            i++;
+        } else {
+            compiled_prog[i] = dispatch_table[prog[i]];
+        }
+    }
+}
+
+static uint32_t eval_static_term(void** pc) {
+    uint32_t static_val_stack[256];
+    uint32_t val_sp = 0;
+    while(1) {
+        void* op = *pc++;
+        if (op == dispatch_table[OP_NUL]) {
+            static_val_stack[val_sp++] = PTR_NUL;
+        } else if (op == dispatch_table[OP_BT0]) {
+            static_val_stack[val_sp++] = PTR_BT0;
+        } else if (op == dispatch_table[OP_BT1]) {
+            static_val_stack[val_sp++] = PTR_BT1;
+        } else if (op == dispatch_table[OP_TUP]) {
+            uint32_t right = static_val_stack[--val_sp];
+            uint32_t left  = static_val_stack[--val_sp];
+            static_val_stack[val_sp++] = alloc(left, right);
+        } else if (op == dispatch_table[OP_REC]) {
+            stats.app_fun++;
+            uint32_t rec_arg = static_val_stack[--val_sp];
+            static_val_stack[val_sp++] = eval_app(rec_arg, compiled_prog);
+        } else if (op == dispatch_table[OP_END]) {
+            return static_val_stack[--val_sp];
+        }
+    }
+}
+
+void show_term(uint32_t ptr) {
+    if (ptr == PTR_NUL) {
+        printf("()");
+    } else if (ptr == PTR_BT0) {
+        printf("0");
+    } else if (ptr == PTR_BT1) {
+        printf("1");
+    } else {
+        printf("(");
+        uint32_t val = heap[ptr];
+        show_term(val & 0xFFFF);
+        printf(",");
+        show_term(val >> 16);
+        printf(")");
+    }
+}
+
+int main() {
+    const char* prog_src = "λ! λ{\n"
+    "    0: λ! λ{\n"
+    "      0: λx. ~(0,(1,(~(1,(1,x)),(0,()))))\n"
+    "      1: λ! λ! λ{\n"
+    "        0: λ(). λzs. zs\n"
+    "        1: λ! λ{\n"
+    "          0: λxs. λzs. ~(0,(1,(xs,(1,(0,zs)))))\n"
+    "          1: λxs. λzs. ~(0,(0,~(1,(0,(zs,(1,(1,xs)))))))\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "    1: λ! λ{\n"
+    "      0: λ! λ! λ{\n"
+    "        0: λ(). λys. ys\n"
+    "        1: λ! λx. λxs. λys. (1,(x,~(1,(0,(xs,ys)))))\n"
+    "      }\n"
+    "      1: λ! λ{\n"
+    "        0: λ(). (0,())\n"
+    "        1: λ! λ{\n"
+    "          0: λxs. (1,(1,~(1,(1,xs))))\n"
+    "          1: λxs. (1,(0,xs))\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "  }";
+
+    uint32_t idx = 0;
+    parse_func_src(prog_src, &idx);
+
+    char n_buf[2048];
+    strcpy(n_buf, "(0,())");
+    for (int i = 0; i < 22; i++) {
+        char temp[2048];
+        sprintf(temp, "(1,(1,%s))", n_buf);
+        strcpy(n_buf, temp);
+    }
+    char input_src[2048];
+    sprintf(input_src, "~(0,(0,%s))", n_buf);
+
+    uint32_t input_idx = 0;
+    uint32_t input_pc = prog_len;
+    parse_term_src(input_src, &input_idx);
+    prog[prog_len++] = OP_END;
+
+    compile_prog();
+
+    uint32_t result = eval_static_term(&compiled_prog[input_pc]);
+
+    show_term(result);
+    printf("\n");
+    uint32_t total = stats.app_fun + stats.app_lam + stats.app_mat + stats.app_get + stats.app_use;
+    printf("Interactions: %u\n", total);
+    printf("- APP-FUN: %u\n", stats.app_fun);
+    printf("- APP-LAM: %u\n", stats.app_lam);
+    printf("- APP-MAT: %u\n", stats.app_mat);
+    printf("- APP-GET: %u\n", stats.app_get);
+    printf("- APP-USE: %u\n", stats.app_use);
+
+    printf("\nAllocation profiling:\n");
+    printf("- alloc calls:      %llu\n", (unsigned long long)alloc_calls);
+    printf("- alloc scans:      0\n");
+    printf("- scans/alloc:      0.0000\n");
+    printf("- free_term calls:  %llu\n", (unsigned long long)free_calls);
+    printf("- max K seen:       %u (of 16384 slots = %.2f%% fill)\n", max_K_seen, (double)max_K_seen / 16384.0 * 100.0);
+
+    return 0;
+}
+
+keep optimizing it further, still far from 1m (around 750m now)
+rewrite the file from scratch using a whole new approach.
+think for a VERY LONG TIME this turn
+this is your final chance.
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdalign.h>
+
+// Pointers
+#define PTR_TUP 0x0000
+#define PTR_NUL 0x4000
+#define PTR_BT0 0x8000
+#define PTR_BT1 0xC000
+
+// Memory and GC: Dense packed 32-bit heap & O(1) freelist allocator
+alignas(64) uint32_t heap[16384]; 
+uint32_t freelist[16384];
+uint32_t free_sp = 0;
+
+// Allocation profiling counters
+uint64_t alloc_calls = 0;
+uint64_t free_calls = 0;
+uint32_t max_K_seen = 0;
+
+void init_heap() {
+    free_sp = 16383;
+    for (uint32_t i = 0; i < 16383; i++) {
+        freelist[i] = 16383 - i; 
+    }
+}
+
+static inline uint32_t alloc(uint32_t fst, uint32_t snd) {
+    alloc_calls++;
+    uint32_t loc = freelist[--free_sp];
+    uint32_t used = 16383 - free_sp;
+    if (used > max_K_seen) max_K_seen = used;
+    heap[loc] = fst | (snd << 16);
+    return loc;
+}
+
+static inline void free_loc(uint32_t loc) {
+    free_calls++;
+    freelist[free_sp++] = loc;
+}
+
+// Runtime State
+typedef struct {
+    uint32_t app_fun, app_lam, app_mat, app_get, app_use;
+} Stats;
+
+enum {
+    OP_DONE = 0,
+    OP_GET, OP_LAM, OP_USE, OP_MAT,
+    OP_NUL, OP_BT0, OP_BT1, OP_VAR, OP_TUP, OP_REC, OP_TAIL_REC, OP_END,
+    OP_GET_MAT, OP_GET_LAM, OP_GET_USE, OP_REC_TUP, OP_TAIL_REC_TUP
+};
+
+uint16_t prog[4096];
+uint32_t prog_len = 0;
+Stats stats = {0};
+
+char names[24][16];
+int name_count = 0;
+
+int find_name(const char* name) {
+    for (int i = name_count - 1; i >= 0; i--) {
+        if (strcmp(names[i], name) == 0) return i;
+    }
+    return -1;
+}
+
+// Parser
+void skip_ws(const char* src, uint32_t* idx) {
+    while (src[*idx] == ' ' || src[*idx] == '\n' || src[*idx] == '\t' || src[*idx] == '\r') (*idx)++;
+}
+
+bool match_str(const char* src, uint32_t* idx, const char* str) {
+    skip_ws(src, idx);
+    uint32_t len = strlen(str);
+    if (strncmp(src + *idx, str, len) == 0) {
+        *idx += len;
+        return true;
+    }
+    return false;
+}
+
+void expect_str(const char* src, uint32_t* idx, const char* str) {
+    if (!match_str(src, idx, str)) {
+        printf("Expected '%s' at index %u\n", str, *idx);
+        exit(1);
+    }
+}
+
+void parse_name_str(const char* src, uint32_t* idx, char* out) {
+    skip_ws(src, idx);
+    int len = 0;
+    while (src[*idx] && strchr("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789", src[*idx])) {
+        out[len++] = src[(*idx)++];
+    }
+    out[len] = '\0';
+}
+
+bool is_bt(const char* src, uint32_t* idx, char c) {
+    skip_ws(src, idx);
+    if (src[*idx] == c) {
+        char next = src[*idx+1];
+        if ((next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') || (next >= '0' && next <= '9') || next == '_' || next == '{') {
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+void parse_term_src(const char* src, uint32_t* idx);
+
+void parse_func_src(const char* src, uint32_t* idx) {
+    skip_ws(src, idx);
+    if (match_str(src, idx, "λ!")) {
+        prog[prog_len++] = OP_GET;
+        parse_func_src(src, idx);
+        return;
+    }
+    if (match_str(src, idx, "λ")) {
+        if (match_str(src, idx, "{")) {
+            expect_str(src, idx, "0"); expect_str(src, idx, ":");
+            uint32_t op_pos = prog_len;
+            prog[prog_len++] = OP_MAT;
+            prog[prog_len++] = 0; 
+            parse_func_src(src, idx);
+            match_str(src, idx, ";");
+            expect_str(src, idx, "1"); expect_str(src, idx, ":");
+            prog[op_pos + 1] = prog_len - (op_pos + 2);
+            parse_func_src(src, idx);
+            match_str(src, idx, ";");
+            expect_str(src, idx, "}");
+            return;
+        }
+        if (match_str(src, idx, "()")) {
+            expect_str(src, idx, ".");
+            prog[prog_len++] = OP_USE;
+            parse_func_src(src, idx);
+            return;
+        }
+        char name[16];
+        parse_name_str(src, idx, name);
+        expect_str(src, idx, ".");
+        strcpy(names[name_count++], name);
+        prog[prog_len++] = OP_LAM;
+        parse_func_src(src, idx);
+        name_count--;
+        return;
+    }
+    
+    skip_ws(src, idx);
+    if (match_str(src, idx, "~")) {
+        parse_term_src(src, idx);
+        prog[prog_len++] = OP_TAIL_REC;
+    } else {
+        parse_term_src(src, idx);
+        prog[prog_len++] = OP_END;
+    }
+}
+
+void parse_term_src(const char* src, uint32_t* idx) {
+    skip_ws(src, idx);
+    if (match_str(src, idx, "~")) {
+        parse_term_src(src, idx);
+        prog[prog_len++] = OP_REC;
+        return;
+    }
+    if (src[*idx] == '(' && src[*idx+1] == ')') {
+        *idx += 2;
+        prog[prog_len++] = OP_NUL;
+        return;
+    }
+    if (src[*idx] == '(') {
+        match_str(src, idx, "(");
+        parse_term_src(src, idx); 
+        expect_str(src, idx, ",");
+        parse_term_src(src, idx); 
+        expect_str(src, idx, ")");
+        prog[prog_len++] = OP_TUP;
+        return;
+    }
+    if (is_bt(src, idx, '0')) {
+        (*idx)++;
+        prog[prog_len++] = OP_BT0;
+        return;
+    }
+    if (is_bt(src, idx, '1')) {
+        (*idx)++;
+        prog[prog_len++] = OP_BT1;
+        return;
+    }
+    char name[16];
+    parse_name_str(src, idx, name);
+    int var_idx = find_name(name);
+    if (var_idx == -1) {
+        printf("Unbound variable '%s'\n", name);
+        exit(1);
+    }
+    prog[prog_len++] = OP_VAR;
+    prog[prog_len++] = var_idx;
+}
+
+static void** dispatch_table;
+static void* compiled_prog[4096];
+static uint32_t pc_map[4096];
+
+static uint32_t val_stack[8192];
+static uint32_t term_stack[8192];
+static void* call_stack_pc[8192];
+static uint32_t* call_stack_ctx[16384];
+static uint32_t ctx[1024 * 64];
+
+static uint32_t eval_app_from(void** pc_start, void** prog_start) {
+    if (__builtin_expect(prog_start == NULL, 0)) {
+        static const void* dispatch[] = {
+            &&L_END,         // OP_DONE (0)
+            &&L_GET,         // OP_GET
+            &&L_LAM,         // OP_LAM
+            &&L_USE,         // OP_USE
+            &&L_MAT,         // OP_MAT
+            &&L_NUL,         // OP_NUL
+            &&L_BT0,         // OP_BT0
+            &&L_BT1,         // OP_BT1
+            &&L_VAR,         // OP_VAR
+            &&L_TUP,         // OP_TUP
+            &&L_REC,         // OP_REC
+            &&L_TAIL_REC,    // OP_TAIL_REC
+            &&L_END,         // OP_END
+            &&L_GET_MAT,     // OP_GET_MAT
+            &&L_GET_LAM,     // OP_GET_LAM
+            &&L_GET_USE,     // OP_GET_USE
+            &&L_REC_TUP,     // OP_REC_TUP
+            &&L_TAIL_REC_TUP // OP_TAIL_REC_TUP
+        };
+        dispatch_table = (void**)dispatch;
+        return 0;
+    }
+
+    uint32_t* v_sp = val_stack;
+    uint32_t* t_sp = term_stack;
+    void*** c_sp_pc = (void***)call_stack_pc;
+    uint32_t** c_sp_ctx = call_stack_ctx;
+    
+    uint32_t* current_ctx = ctx;
+    uint32_t* frame_base = ctx;
+
+    void** pc = pc_start;
+    uint32_t term = 0;
+    uint32_t arg = 0;
+
+    goto **pc++;
+
+tail_call:
+    pc = prog_start;
+    term = arg;
+    t_sp = term_stack; // Safe reset of matcher stack
+    goto **pc++;
+
+L_GET:
+    stats.app_get++;
+    {
+        uint32_t val = heap[term];
+        free_loc(term);
+        *t_sp++ = val >> 16;
+        term = val & 0xFFFF;
+    }
+    goto **pc++;
+
+L_LAM:
+    stats.app_lam++;
+    *current_ctx++ = term;
+    if (t_sp > term_stack) term = *--t_sp;
+    goto **pc++;
+
+L_USE:
+    stats.app_use++;
+    if (t_sp > term_stack) term = *--t_sp;
+    goto **pc++;
+
+L_MAT:
+    stats.app_mat++;
+    {
+        void** branch1 = (void**)*pc++;
+        if (term == PTR_BT1) pc = branch1;
+    }
+    if (t_sp > term_stack) term = *--t_sp;
+    goto **pc++;
+
+L_NUL: 
+    *v_sp++ = PTR_NUL; 
+    goto **pc++;
+
+L_BT0: 
+    *v_sp++ = PTR_BT0; 
+    goto **pc++;
+
+L_BT1: 
+    *v_sp++ = PTR_BT1; 
+    goto **pc++;
+
+L_VAR:
+    *v_sp++ = frame_base[(uintptr_t)(*pc++)];
+    goto **pc++;
+
+L_TUP:
+    {
+        uint32_t right = *--v_sp;
+        uint32_t left  = *(v_sp - 1);
+        *(v_sp - 1) = alloc(left, right);
+    }
+    goto **pc++;
+
+L_REC:
+    stats.app_fun++;
+    {
+        arg = *--v_sp;
+        *c_sp_pc++ = pc;
+        *c_sp_ctx++ = frame_base;
+        *c_sp_ctx++ = current_ctx;
+        frame_base = current_ctx;
+    }
+    goto tail_call;
+
+L_TAIL_REC:
+    stats.app_fun++;
+    arg = *--v_sp;
+    current_ctx = frame_base; 
+    goto tail_call;
+
+L_END:
+    {
+        uint32_t res = *--v_sp;
+        if (c_sp_pc == (void***)call_stack_pc) return res;
+        
+        current_ctx = *--c_sp_ctx;
+        frame_base = *--c_sp_ctx;
+        pc = *--c_sp_pc;
+        
+        *v_sp++ = res;
+    }
+    goto **pc++;
+
+L_GET_MAT:
+    stats.app_get++;
+    stats.app_mat++;
+    {
+        void** branch1 = (void**)*pc++;
+        uint32_t val = heap[term];
+        free_loc(term);
+        if ((val & 0xFFFF) == PTR_BT1) pc = branch1;
+        term = val >> 16;
+    }
+    goto **pc++;
+
+L_GET_LAM:
+    stats.app_get++;
+    stats.app_lam++;
+    {
+        uint32_t val = heap[term];
+        free_loc(term);
+        *current_ctx++ = val & 0xFFFF;
+        term = val >> 16;
+    }
+    goto **pc++;
+
+L_GET_USE:
+    stats.app_get++;
+    stats.app_use++;
+    {
+        uint32_t val = heap[term];
+        free_loc(term);
+        term = val >> 16;
+    }
+    goto **pc++;
+
+L_REC_TUP:
+    stats.app_fun++;
+    stats.app_get++;
+    {
+        uint32_t right = *--v_sp;
+        uint32_t left  = *--v_sp;
+        
+        *c_sp_pc++ = pc;
+        *c_sp_ctx++ = frame_base;
+        *c_sp_ctx++ = current_ctx;
+        
+        frame_base = current_ctx;
+        
+        t_sp = term_stack;
+        *t_sp++ = right;
+        term = left;
+        pc = prog_start + 1;
+    }
+    goto **pc++;
+
+L_TAIL_REC_TUP:
+    stats.app_fun++;
+    stats.app_get++;
+    {
+        uint32_t right = *--v_sp;
+        uint32_t left  = *--v_sp;
+        
+        t_sp = term_stack;
+        *t_sp++ = right;
+        term = left;
+        
+        current_ctx = frame_base;
+        pc = prog_start + 1;
+    }
+    goto **pc++;
+}
+
+void compile_prog() {
+    uint32_t j = 0;
+    for (uint32_t i = 0; i < prog_len; i++) {
+        pc_map[i] = j;
+        uint16_t op = prog[i];
+        
+        if (op == OP_GET && i > 0 && i + 1 < prog_len && prog[i+1] == OP_MAT) {
+            compiled_prog[j++] = dispatch_table[OP_GET_MAT];
+            compiled_prog[j++] = NULL;
+            i += 2;
+        } else if (op == OP_GET && i > 0 && i + 1 < prog_len && prog[i+1] == OP_LAM) {
+            compiled_prog[j++] = dispatch_table[OP_GET_LAM];
+            i += 1;
+        } else if (op == OP_GET && i > 0 && i + 1 < prog_len && prog[i+1] == OP_USE) {
+            compiled_prog[j++] = dispatch_table[OP_GET_USE];
+            i += 1;
+        } else if (op == OP_TUP && i + 1 < prog_len && prog[i+1] == OP_REC) {
+            compiled_prog[j++] = dispatch_table[OP_REC_TUP];
+            i += 1;
+        } else if (op == OP_TUP && i + 1 < prog_len && prog[i+1] == OP_TAIL_REC) {
+            compiled_prog[j++] = dispatch_table[OP_TAIL_REC_TUP];
+            i += 1;
+        } else if (op == OP_MAT) {
+            compiled_prog[j++] = dispatch_table[OP_MAT];
+            compiled_prog[j++] = NULL;
+            i += 1;
+        } else if (op == OP_VAR) {
+            compiled_prog[j++] = dispatch_table[OP_VAR];
+            compiled_prog[j++] = (void*)(uintptr_t)prog[i+1];
+            i += 1;
+        } else {
+            compiled_prog[j++] = dispatch_table[op];
+        }
+    }
+    
+    j = 0;
+    for (uint32_t i = 0; i < prog_len; i++) {
+        uint16_t op = prog[i];
+        
+        if (op == OP_GET && i > 0 && i + 1 < prog_len && prog[i+1] == OP_MAT) {
+            uint32_t delta = prog[i+2];
+            uint32_t original_target = i + 3 + delta;
+            compiled_prog[j + 1] = &compiled_prog[pc_map[original_target]];
+            j += 2; i += 2;
+        } else if (op == OP_GET && i > 0 && i + 1 < prog_len && prog[i+1] == OP_LAM) {
+            j += 1; i += 1;
+        } else if (op == OP_GET && i > 0 && i + 1 < prog_len && prog[i+1] == OP_USE) {
+            j += 1; i += 1;
+        } else if (op == OP_TUP && i + 1 < prog_len && prog[i+1] == OP_REC) {
+            j += 1; i += 1;
+        } else if (op == OP_TUP && i + 1 < prog_len && prog[i+1] == OP_TAIL_REC) {
+            j += 1; i += 1;
+        } else if (op == OP_MAT) {
+            uint32_t delta = prog[i+1];
+            uint32_t original_target = i + 2 + delta;
+            compiled_prog[j + 1] = &compiled_prog[pc_map[original_target]];
+            j += 2; i += 1;
+        } else if (op == OP_VAR) {
+            j += 2; i += 1;
+        } else {
+            j += 1;
+        }
+    }
+}
+
+void show_term(uint32_t ptr) {
+    if (ptr == PTR_NUL) {
+        printf("()");
+    } else if (ptr == PTR_BT0) {
+        printf("0");
+    } else if (ptr == PTR_BT1) {
+        printf("1");
+    } else {
+        printf("(");
+        uint32_t val = heap[ptr];
+        show_term(val & 0xFFFF);
+        printf(",");
+        show_term(val >> 16);
+        printf(")");
+    }
+}
+
+//int main() {
+//    init_heap();
+//
+//    const char* prog_src = "λ! λ{\n"
+//    "    0: λ! λ{\n"
+//    "      0: λx. ~(0,(1,(~(1,(1,x)),(0,()))))\n"
+//    "      1: λ! λ! λ{\n"
+//    "        0: λ(). λzs. zs\n"
+//    "        1: λ! λ{\n"
+//    "          0: λxs. λzs. ~(0,(1,(xs,(1,(0,zs)))))\n"
+//    "          1: λxs. λzs. ~(0,(0,~(1,(0,(zs,(1,(1,xs)))))))\n"
+//    "        }\n"
+//    "      }\n"
+//    "    }\n"
+//    "    1: λ! λ{\n"
+//    "      0: λ! λ! λ{\n"
+//    "        0: λ(). λys. ys\n"
+//    "        1: λ! λx. λxs. λys. (1,(x,~(1,(0,(xs,ys)))))\n"
+//    "      }\n"
+//    "      1: λ! λ{\n"
+//    "        0: λ(). (0,())\n"
+//    "        1: λ! λ{\n"
+//    "          0: λxs. (1,(1,~(1,(1,xs))))\n"
+//    "          1: λxs. (1,(0,xs))\n"
+//    "        }\n"
+//    "      }\n"
+//    "    }\n"
+//    "  }";
+//
+//    uint32_t idx = 0;
+//    parse_func_src(prog_src, &idx);
+//
+//    char n_buf[2048];
+//    strcpy(n_buf, "(0,())");
+//    for (int i = 0; i < 22; i++) {
+//        char temp[2048];
+//        sprintf(temp, "(1,(1,%s))", n_buf);
+//        strcpy(n_buf, temp);
+//    }
+//    char input_src[2048];
+//    sprintf(input_src, "~(0,(0,%s))", n_buf);
+//
+//    uint32_t input_idx = 0;
+//    uint32_t input_pc = prog_len;
+//    parse_term_src(input_src, &input_idx);
+//    prog[prog_len++] = OP_END;
+//
+//    eval_app_from(NULL, NULL);
+//    compile_prog();
+//
+//    uint32_t result = eval_app_from(&compiled_prog[pc_map[input_pc]], compiled_prog);
+//
+//    show_term(result);
+//    printf("\n");
+//    uint32_t total = stats.app_fun + stats.app_lam + stats.app_mat + stats.app_get + stats.app_use;
+//    printf("Interactions: %u\n", total);
+//    printf("- APP-FUN: %u\n", stats.app_fun);
+//    printf("- APP-LAM: %u\n", stats.app_lam);
+//    printf("- APP-MAT: %u\n", stats.app_mat);
+//    printf("- APP-GET: %u\n", stats.app_get);
+//    printf("- APP-USE: %u\n", stats.app_use);
+//
+//    printf("\nAllocation profiling:\n");
+//    printf("- alloc calls:      %llu\n", (unsigned long long)alloc_calls);
+//    printf("- alloc scans:      0\n");
+//    printf("- scans/alloc:      0.0000\n");
+//    printf("- free_term calls:  %llu\n", (unsigned long long)free_calls);
+//    printf("- max K seen:       %u (of 16384 slots = %.2f%% fill)\n", max_K_seen, (double)max_K_seen / 16384.0 * 100.0);
+//
+//    return 0;
+//}
+
+// please include the time and interactions/s
+
+#include <time.h>
+
+int main() {
+    init_heap();
+
+    const char* prog_src = "λ! λ{\n"
+    "    0: λ! λ{\n"
+    "      0: λx. ~(0,(1,(~(1,(1,x)),(0,()))))\n"
+    "      1: λ! λ! λ{\n"
+    "        0: λ(). λzs. zs\n"
+    "        1: λ! λ{\n"
+    "          0: λxs. λzs. ~(0,(1,(xs,(1,(0,zs)))))\n"
+    "          1: λxs. λzs. ~(0,(0,~(1,(0,(zs,(1,(1,xs)))))))\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "    1: λ! λ{\n"
+    "      0: λ! λ! λ{\n"
+    "        0: λ(). λys. ys\n"
+    "        1: λ! λx. λxs. λys. (1,(x,~(1,(0,(xs,ys)))))\n"
+    "      }\n"
+    "      1: λ! λ{\n"
+    "        0: λ(). (0,())\n"
+    "        1: λ! λ{\n"
+    "          0: λxs. (1,(1,~(1,(1,xs))))\n"
+    "          1: λxs. (1,(0,xs))\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "  }";
+
+    uint32_t idx = 0;
+    parse_func_src(prog_src, &idx);
+
+    char n_buf[2048];
+    strcpy(n_buf, "(0,())");
+    for (int i = 0; i < 22; i++) {
+        char temp[2048];
+        sprintf(temp, "(1,(1,%s))", n_buf);
+        strcpy(n_buf, temp);
+    }
+    char input_src[2048];
+    sprintf(input_src, "~(0,(0,%s))", n_buf);
+
+    uint32_t input_idx = 0;
+    uint32_t input_pc = prog_len;
+    parse_term_src(input_src, &input_idx);
+    prog[prog_len++] = OP_END;
+
+    eval_app_from(NULL, NULL);
+    compile_prog();
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    uint32_t result = eval_app_from(&compiled_prog[pc_map[input_pc]], compiled_prog);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+
+    show_term(result);
+    printf("\n");
+    uint32_t total = stats.app_fun + stats.app_lam + stats.app_mat + stats.app_get + stats.app_use;
+    printf("Interactions: %u\n", total);
+    printf("- APP-FUN: %u\n", stats.app_fun);
+    printf("- APP-LAM: %u\n", stats.app_lam);
+    printf("- APP-MAT: %u\n", stats.app_mat);
+    printf("- APP-GET: %u\n", stats.app_get);
+    printf("- APP-USE: %u\n", stats.app_use);
+
+    printf("\nTime: %.4f seconds\n", elapsed);
+    printf("Interactions/s: %.0f\n", elapsed > 0 ? (double)total / elapsed : 0.0);
+
+    printf("\nAllocation profiling:\n");
+    printf("- alloc calls:      %llu\n", (unsigned long long)alloc_calls);
+    printf("- alloc scans:      0\n");
+    printf("- scans/alloc:      0.0000\n");
+    printf("- free_term calls:  %llu\n", (unsigned long long)free_calls);
+    printf("- max K seen:       %u (of 16384 slots = %.2f%% fill)\n", max_K_seen, (double)max_K_seen / 16384.0 * 100.0);
+
+    return 0;
+}
+
+
+
+
+
+
+
