@@ -1,4 +1,4 @@
-;j// LamBit.ts
+// LamBit.ts
 // =========
 // A minimal functional language based on binary pattern-matching case-trees.
 //
