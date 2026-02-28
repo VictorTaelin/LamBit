@@ -187,13 +187,19 @@ typedef struct {
   int         bind_len;
 } Parser;
 
-static Ptr   HEAP[HEAP_SIZE] __attribute__((aligned(64)));
+#if LAMBIT_PTR_BITS == 16
+static uint32_t HEAP[HEAP_SIZE / 2] __attribute__((aligned(64)));
+#else
+static Ptr HEAP[HEAP_SIZE] __attribute__((aligned(64)));
+#endif
 static uint16_t HP = 2; // bump cursor
 static uint16_t FREE_HEAD = 0;
 static Stats STATS;
 static const Code* PROG_CODE = NULL;
 static uint32_t PROG_PC = 0;
 static bool PROG_TOP_GET = false;
+static bool PROG_TOP_GET_MAT = false;
+static uint32_t PROG_TOP_MAT_DELTA = 0;
 static Ptr SUB_STACK[MAX_SUB];
 static uint32_t SUB_SP = 0;
 static Ptr FEED_STACK[MAX_FEED];
@@ -234,15 +240,64 @@ static inline bool is_tup(uint8_t op) {
   return op >= OP_TUP;
 }
 
+static inline Ptr heap_get_fst(uint16_t l) {
+#if LAMBIT_PTR_BITS == 16
+  return (Ptr)(HEAP[l >> 1] & 0xFFFFu);
+#else
+  return HEAP[l + 0];
+#endif
+}
+
+static inline Ptr heap_get_snd(uint16_t l) {
+#if LAMBIT_PTR_BITS == 16
+  return (Ptr)(HEAP[l >> 1] >> 16);
+#else
+  return HEAP[l + 1];
+#endif
+}
+
+static inline void heap_set_pair(uint16_t l, Ptr a, Ptr b) {
+#if LAMBIT_PTR_BITS == 16
+  HEAP[l >> 1] = ((uint32_t)b << 16) | (uint32_t)a;
+#else
+  HEAP[l + 0] = a;
+  HEAP[l + 1] = b;
+#endif
+}
+
+static inline __attribute__((unused))
+bool heap_pair_is_zero(uint16_t l) {
+#if LAMBIT_PTR_BITS == 16
+  return HEAP[l >> 1] == 0;
+#else
+  return HEAP[l + 0] == 0 && HEAP[l + 1] == 0;
+#endif
+}
+
+static inline uint16_t heap_get_free_next(uint16_t l) {
+#if LAMBIT_PTR_BITS == 16
+  return (uint16_t)(HEAP[l >> 1] & 0xFFFFu);
+#else
+  return (uint16_t)HEAP[l + 0];
+#endif
+}
+
+static inline void heap_set_free_next(uint16_t l, uint16_t nxt) {
+#if LAMBIT_PTR_BITS == 16
+  HEAP[l >> 1] = (uint32_t)nxt;
+#else
+  HEAP[l + 0] = nxt;
+#endif
+}
+
 static inline void free2(uint16_t l) {
 #if LAMBIT_FREE_LIST && LAMBIT_TRUST_AFFINE
-  HEAP[l + 0] = FREE_HEAD;
+  heap_set_free_next(l, FREE_HEAD);
   FREE_HEAD = l;
 #else
-  HEAP[l + 0] = 0;
-  HEAP[l + 1] = 0;
+  heap_set_pair(l, 0, 0);
 #if LAMBIT_FREE_LIST
-  HEAP[l + 0] = FREE_HEAD;
+  heap_set_free_next(l, FREE_HEAD);
   FREE_HEAD = l;
 #else
   (void)l;
@@ -254,10 +309,10 @@ static void gc_term(Ptr p) {
   if (PTR_TAG(p) != CTR_TUP) return;
   uint16_t l = PTR_LOC(p);
 #if !(LAMBIT_FREE_LIST && LAMBIT_TRUST_AFFINE)
-  if (HEAP[l + 0] == 0 && HEAP[l + 1] == 0) return;
+  if (heap_pair_is_zero(l)) return;
 #endif
-  Ptr a = HEAP[l + 0];
-  Ptr b = HEAP[l + 1];
+  Ptr a = heap_get_fst(l);
+  Ptr b = heap_get_snd(l);
   free2(l);
   gc_term(a);
   gc_term(b);
@@ -267,9 +322,9 @@ static uint16_t alloc2(void) {
 #if LAMBIT_FREE_LIST
   if (LIKELY(FREE_HEAD != 0)) {
     uint16_t l = FREE_HEAD;
-    FREE_HEAD = (uint16_t)HEAP[l + 0];
+    FREE_HEAD = heap_get_free_next(l);
 #if !LAMBIT_TRUST_AFFINE
-    HOT_ASSERT(HEAP[l + 0] == 0 && HEAP[l + 1] == 0, "Corrupt free-list entry.");
+    HOT_ASSERT(heap_pair_is_zero(l), "Corrupt free-list entry.");
 #endif
     return l;
   }
@@ -284,7 +339,7 @@ static uint16_t alloc2(void) {
   uint32_t tries = 0;
   while (tries < HEAP_SIZE) {
     if (HP >= HEAP_SIZE - 1) HP = 2;
-    if (HEAP[HP] == 0 && HEAP[HP + 1] == 0) {
+    if (heap_pair_is_zero(HP)) {
       uint16_t l = HP;
       HP += 2;
       return l;
@@ -299,8 +354,7 @@ static uint16_t alloc2(void) {
 
 static inline Ptr mk_tup(Ptr a, Ptr b) {
   uint16_t l = alloc2();
-  HEAP[l + 0] = a;
-  HEAP[l + 1] = b;
+  heap_set_pair(l, a, b);
   return MK_PTR(CTR_TUP, l);
 }
 
@@ -556,6 +610,7 @@ uint32_t feed_term(
   uint8_t op = 0;
   uint32_t feed_sp = 0;
   uint32_t sub_sp = *sub_sp_p;
+  const uint8_t* cc = PROG_CODE->buf;
   uint64_t app_lam = *app_lam_p;
   uint64_t app_mat = *app_mat_p;
   uint64_t app_get = *app_get_p;
@@ -575,12 +630,12 @@ uint32_t feed_term(
   }
 
 #define FEED_DISPATCH() do { \
-    op = PROG_CODE->buf[pc]; \
+    op = cc[pc]; \
     goto *jump_tbl[op]; \
   } while (0)
 #else
 #define FEED_DISPATCH() do { \
-    op = PROG_CODE->buf[pc]; \
+    op = cc[pc]; \
     goto L_SWITCH; \
   } while (0)
 #endif
@@ -618,11 +673,11 @@ L_GET: {
     app_get++;
 #endif
     uint16_t l = PTR_LOC(arg);
-    Ptr a = HEAP[l + 0];
-    Ptr b = HEAP[l + 1];
+    Ptr a = heap_get_fst(l);
+    Ptr b = heap_get_snd(l);
     free2(l);
 
-    uint8_t nxt = PROG_CODE->buf[pc + 1];
+    uint8_t nxt = cc[pc + 1];
     if (is_mat(nxt)) {
 #if LAMBIT_COUNT_STATS
       app_mat++;
@@ -730,6 +785,7 @@ static Ptr eval_term(const Code* c, uint32_t start_pc) {
   Ptr val = PTR_NUL;
   uint32_t pc = start_pc;
   uint8_t code_id = CODE_INPUT;
+  const uint8_t* cc = c->buf;
   uint32_t cont_sp = 0;
   uint32_t sub_sp = SUB_SP;
   uint64_t app_fun = STATS.app_fun;
@@ -737,15 +793,13 @@ static Ptr eval_term(const Code* c, uint32_t start_pc) {
   uint64_t app_mat = STATS.app_mat;
   uint64_t app_get = STATS.app_get;
   uint64_t app_use = STATS.app_use;
-  const uint8_t* code_buf[2] = { c->buf, PROG_CODE->buf };
-
 #define CONT_PUSH(tag, cid, ssp, pay) do { \
     HOT_ASSERT(cont_sp < MAX_EVAL, "Eval continuation stack overflow."); \
     EVAL_CONT_STACK[cont_sp++] = CONT_MAKE((tag), (cid), (ssp), (pay)); \
   } while (0)
 
 L_EVAL: {
-    op = code_buf[code_id][pc];
+    op = cc[pc];
 
     if (LIKELY(is_tup(op))) goto L_TUP;
     if (is_var(op)) goto L_VAR;
@@ -792,7 +846,7 @@ L_VAR: {
 L_TUP: {
     uint32_t d = (uint32_t)(op - OP_TUP);
     if (d == 1) {
-      uint8_t fst_op = code_buf[code_id][pc + 1];
+      uint8_t fst_op = cc[pc + 1];
       Ptr fst_val = PTR_NUL;
 
       if (fst_op == OP_NUL) {
@@ -837,15 +891,25 @@ L_RET: {
 #if LAMBIT_COUNT_STATS
             app_get++;
 #endif
-            uint32_t body_pc = feed_term(
-              PROG_PC + 1, (Ptr)CONT_PAYLOAD(c0), &sub_sp, &app_lam, &app_mat, &app_get, &app_use
-            );
+            uint32_t body_pc = PROG_PC + 1;
+            if (PROG_TOP_GET_MAT) {
+#if LAMBIT_COUNT_STATS
+              app_mat++;
+#endif
+              Ptr fst = (Ptr)CONT_PAYLOAD(c0);
+              body_pc = (fst == PTR_BT0) ? (PROG_PC + 2) : (PROG_PC + 2 + PROG_TOP_MAT_DELTA);
+            } else {
+              body_pc = feed_term(
+                body_pc, (Ptr)CONT_PAYLOAD(c0), &sub_sp, &app_lam, &app_mat, &app_get, &app_use
+              );
+            }
             body_pc = feed_term(
               body_pc, val, &sub_sp, &app_lam, &app_mat, &app_get, &app_use
             );
             EVAL_CONT_STACK[cont_sp - 2] = CONT_MAKE(CONT_REC_DONE, 0, saved_sp, 0);
             cont_sp = cont_sp - 1;
             code_id = CODE_PROG;
+            cc = PROG_CODE->buf;
             pc = body_pc;
             goto L_EVAL;
           }
@@ -864,6 +928,7 @@ L_RET: {
       sub_sp = CONT_SAVED_SP(c0);
       EVAL_CONT_STACK[cont_sp - 1] = CONT_MAKE(CONT_TUP_DONE, 0, sub_sp, val);
       code_id = CONT_CODE_ID(c0);
+      cc = (code_id == CODE_PROG) ? PROG_CODE->buf : c->buf;
       pc = CONT_PAYLOAD(c0);
       goto L_EVAL;
     }
@@ -873,25 +938,33 @@ L_RET: {
       sub_sp = 0;
       EVAL_CONT_STACK[cont_sp - 1] = CONT_MAKE(CONT_REC_DONE, 0, saved_sp, 0);
       code_id = CODE_PROG;
+      cc = PROG_CODE->buf;
 
-      if (PROG_TOP_GET) {
+      if (PROG_TOP_GET_MAT) {
         HOT_ASSERT(PTR_TAG(val) == CTR_TUP, "Get expected tuple.");
 #if LAMBIT_COUNT_STATS
         app_get++;
 #endif
         uint16_t l = PTR_LOC(val);
-        Ptr a = HEAP[l + 0];
-        Ptr b = HEAP[l + 1];
+        Ptr a = heap_get_fst(l);
+        Ptr b = heap_get_snd(l);
         free2(l);
-
-        uint8_t mat_op = code_buf[CODE_PROG][PROG_PC + 1];
-        HOT_ASSERT(is_mat(mat_op), "Expected MAT after top-level GET.");
 #if LAMBIT_COUNT_STATS
         app_mat++;
 #endif
-        uint32_t d = (uint32_t)(mat_op - OP_MAT);
-        uint32_t nxt_pc = (a == PTR_BT0) ? (PROG_PC + 2) : (PROG_PC + 2 + d);
+        uint32_t nxt_pc = (a == PTR_BT0) ? (PROG_PC + 2) : (PROG_PC + 2 + PROG_TOP_MAT_DELTA);
         pc = feed_term(nxt_pc, b, &sub_sp, &app_lam, &app_mat, &app_get, &app_use);
+      } else if (PROG_TOP_GET) {
+        HOT_ASSERT(PTR_TAG(val) == CTR_TUP, "Get expected tuple.");
+#if LAMBIT_COUNT_STATS
+        app_get++;
+#endif
+        uint16_t l = PTR_LOC(val);
+        Ptr a = heap_get_fst(l);
+        Ptr b = heap_get_snd(l);
+        free2(l);
+        pc = feed_term(PROG_PC + 1, a, &sub_sp, &app_lam, &app_mat, &app_get, &app_use);
+        pc = feed_term(pc, b, &sub_sp, &app_lam, &app_mat, &app_get, &app_use);
       } else {
         pc = feed_term(PROG_PC, val, &sub_sp, &app_lam, &app_mat, &app_get, &app_use);
       }
@@ -941,9 +1014,9 @@ static void show_ptr(Ptr p) {
     case CTR_TUP: {
       uint16_t l = PTR_LOC(p);
       printf("(");
-      show_ptr(HEAP[l + 0]);
+      show_ptr(heap_get_fst(l));
       printf(",");
-      show_ptr(HEAP[l + 1]);
+      show_ptr(heap_get_snd(l));
       printf(")");
       return;
     }
@@ -1022,6 +1095,12 @@ int main(int argc, char** argv) {
   PROG_PC = compile_func(&prog, prog_src);
   PROG_CODE = &prog;
   PROG_TOP_GET = (prog.buf[PROG_PC] == OP_GET);
+  PROG_TOP_GET_MAT = false;
+  PROG_TOP_MAT_DELTA = 0;
+  if (PROG_TOP_GET && is_mat(prog.buf[PROG_PC + 1])) {
+    PROG_TOP_GET_MAT = true;
+    PROG_TOP_MAT_DELTA = (uint32_t)(prog.buf[PROG_PC + 1] - OP_MAT);
+  }
   uint32_t input_pc = compile_term(&input, input_heap);
 
   SUB_SP = 0;
