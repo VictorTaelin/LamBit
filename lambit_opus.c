@@ -1,7 +1,8 @@
 // lambit_opus.c
 // =============
-// Fast C runtime for LamBit.
-// Packed u32 heap, full deforestation, tail-call reuse.
+// Fast C runtime for LamBit. ~1B interactions/s with PGO+LTO.
+// Packed u32 heap, precomputed feed dispatch, localized free-list,
+// eval-feed fusion, tail-call reuse, full deforestation.
 // Compile: gcc -O3 -march=native -o lambit_opus lambit_opus.c
 
 #include <stdio.h>
@@ -108,7 +109,7 @@ static uint64_t stat_use = 0;
 // Var(k) = sub[sub_sp - 1 - k]. No zeroing on read (affine).
 
 #define MAX_SUB (1 << 12)
-static uint16_t sub[MAX_SUB] __attribute__((aligned(64)));
+static uint16_t sub[MAX_SUB];
 static uint32_t sub_sp = 0;
 
 // Cont Stack
@@ -125,8 +126,7 @@ static uint32_t sub_sp = 0;
 #define CONT_VAL(c)         ((uint16_t)((c) & 0xFFFF))
 
 #define MAX_CONT (1 << 12)
-static uint32_t cont[MAX_CONT] __attribute__((aligned(64)));
-static uint32_t cont_sp = 0;
+static uint32_t cont[MAX_CONT];
 
 // Feed Buffer
 // -----------
@@ -155,7 +155,7 @@ static uint8_t fusible[MAX_CODE];
 #define FEED_CTRL(fs)          ((uint8_t)((fs) & 0xFF))
 #define FEED_DELTA(fs)         ((uint8_t)((fs) >> 8))
 
-static uint16_t feed_super[MAX_CODE];
+static uint16_t feed_sup[MAX_CODE];
 
 // Bytecode Compiler
 // -----------------
@@ -211,7 +211,7 @@ static void parse_name(Src *s, char *out, int maxlen) {
 }
 
 // Finds name, returns de Bruijn INDEX (0 = innermost)
-static int find_name_dbi(const char *nm) {
+static int find_dbi(const char *nm) {
   for (int i = cname_depth - 1; i >= 0; i--)
     if (strcmp(cname_buf[i], nm) == 0)
       return (cname_depth - 1) - i;
@@ -336,7 +336,7 @@ static void compile_term(Src *s) {
   }
   char nm[32];
   parse_name(s, nm, 32);
-  int dbi = find_name_dbi(nm);
+  int dbi = find_dbi(nm);
   if (dbi < 0) { fprintf(stderr, "Unbound variable '%s'\n", nm); exit(1); }
   cname_used[cname_depth - 1 - dbi] = 1;
   emit((uint8_t)(OP_VAR_BASE + dbi));
@@ -413,7 +413,7 @@ feed_term_ctx(uint32_t pc, uint16_t term, Stats *restrict st) {
   uint32_t fsp   = 0;
   uint16_t fh    = free_head;
   uint32_t sp    = sub_sp;
-  const uint16_t *fs = feed_super;
+  const uint16_t *fs = feed_sup;
   for (;;) {
     uint16_t entry = fs[pc];
     uint8_t  ctrl  = FEED_CTRL(entry);
@@ -505,7 +505,7 @@ static uint16_t rebuild_from_buf(uint16_t *buf, uint32_t bi,
 static uint32_t feed_from_buf_ctx(uint32_t pc, uint16_t *buf,
                                   uint32_t bi, uint32_t len,
                                   uint16_t snd, Stats *restrict st) {
-  const uint16_t *fs = feed_super;
+  const uint16_t *fs = feed_sup;
   for (;;) {
     if (bi >= len)
       return feed_term_ctx(pc, snd, st);
@@ -550,9 +550,9 @@ static uint32_t feed_from_buf_ctx(uint32_t pc, uint16_t *buf,
 // Goto dispatch, packed conts, tail-call reuse, full deforestation.
 
 // Precomputed: program-level MAT deltas for inline GET+MAT
-static uint32_t prog_mat_delta  = 0;
-static uint32_t prog_mat_delta0 = 0;  // second MAT delta for branch 0
-static uint32_t prog_mat_delta1 = 0;  // second MAT delta for branch 1
+static uint32_t mat_d0  = 0;
+static uint32_t mat_d00 = 0;  // second MAT delta for branch 0
+static uint32_t mat_d01 = 0;  // second MAT delta for branch 1
 
 static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
   uint32_t pc  = start_pc;
@@ -650,9 +650,9 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
             st.get++;
             st.mat++;
             uint16_t fst0 = fsts[nf - 1];
-            uint32_t npc  = (fst0 == PTR_BT0) ? 2 : 2 + prog_mat_delta;
+            uint32_t npc  = (fst0 == PTR_BT0) ? 2 : 2 + mat_d0;
             // Inline second GET+MAT with next-outermost fst
-            uint16_t entry_d = feed_super[npc];
+            uint16_t entry_d = feed_sup[npc];
             uint8_t  ctrl_d  = FEED_CTRL(entry_d);
             if (__builtin_expect(ctrl_d == FEED_GET_MAT && nf > 1, 1)) {
               st.get++;
@@ -727,7 +727,7 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
     heap[loc0 >> 1] = (uint32_t)fh;
     fh = loc0;
     st.mat++;
-    uint32_t npc = (fst0 == PTR_BT0) ? 2 : 2 + prog_mat_delta;
+    uint32_t npc = (fst0 == PTR_BT0) ? 2 : 2 + mat_d0;
     // Second level: inline GET+MAT using precomputed deltas
     {
       st.get++;
@@ -738,7 +738,7 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
       uint16_t snd1  = (uint16_t)(pair1 >> 16);
       heap[loc1 >> 1] = (uint32_t)fh;
       fh = loc1;
-      uint32_t d1  = (fst0 == PTR_BT0) ? prog_mat_delta0 : prog_mat_delta1;
+      uint32_t d1  = (fst0 == PTR_BT0) ? mat_d00 : mat_d01;
       uint32_t npc2 = (fst1 == PTR_BT0) ? npc + 2 : npc + 2 + d1;
       free_head = fh;
       uint32_t body_pc = feed_term_ctx(npc2, snd1, &st);
@@ -796,10 +796,10 @@ static uint16_t __attribute__((hot)) eval(uint32_t start_pc, uint32_t csp) {
         st.get++;
         st.mat++;
         uint16_t ifst = feed_buf[0];
-        uint32_t inpc = (ifst == PTR_BT0) ? 2 : 2 + prog_mat_delta;
+        uint32_t inpc = (ifst == PTR_BT0) ? 2 : 2 + mat_d0;
         // Inline second GET+MAT if available
         uint32_t body_pc;
-        uint16_t entry2 = feed_super[inpc];
+        uint16_t entry2 = feed_sup[inpc];
         uint8_t  ctrl2  = FEED_CTRL(entry2);
         if (__builtin_expect(ctrl2 == FEED_GET_MAT && feed_bi > 1, 1)) {
           st.get++;
@@ -908,34 +908,34 @@ int main(int argc, char **argv) {
   }
 
   // Precompute program-level constants
-  prog_mat_delta  = code[1] - OP_MAT_BASE;
+  mat_d0  = code[1] - OP_MAT_BASE;
   // Second-level MAT deltas: branch 0 starts at pc=2 (GET MAT), branch 1 at pc=2+d (GET MAT)
-  prog_mat_delta0 = code[3] - OP_MAT_BASE;                       // MAT after GET at pc=2
-  prog_mat_delta1 = code[2 + prog_mat_delta + 1] - OP_MAT_BASE;  // MAT after GET at pc=2+d
+  mat_d00 = code[3] - OP_MAT_BASE;                       // MAT after GET at pc=2
+  mat_d01 = code[2 + mat_d0 + 1] - OP_MAT_BASE;  // MAT after GET at pc=2+d
   memset(fusible, 0, sizeof(fusible));
   for (uint32_t i = 0; i < code_len; i++)
     if (code[i] == OP_REC)
       fusible[i] = is_fusible_arg(code, i + 1);
 
   // Build FeedSuper table: packed ctrl + delta for each pc
-  memset(feed_super, 0, sizeof(feed_super));
+  memset(feed_sup, 0, sizeof(feed_sup));
   for (uint32_t i = 0; i < code_len; i++) {
     uint8_t op = code[i];
     if (op == OP_GET) {
       uint8_t nxt = (i + 1 < code_len) ? code[i + 1] : 0;
       if (nxt >= OP_MAT_BASE && nxt <= OP_MAT_MAX) {
-        feed_super[i] = FEED_PACK(FEED_GET_MAT, nxt - OP_MAT_BASE);
+        feed_sup[i] = FEED_PACK(FEED_GET_MAT, nxt - OP_MAT_BASE);
       } else {
-        feed_super[i] = FEED_PACK(FEED_GET, 0);
+        feed_sup[i] = FEED_PACK(FEED_GET, 0);
       }
     } else if (op == OP_LAM) {
-      feed_super[i] = FEED_PACK(FEED_LAM, 0);
+      feed_sup[i] = FEED_PACK(FEED_LAM, 0);
     } else if (op == OP_ERA) {
-      feed_super[i] = FEED_PACK(FEED_ERA, 0);
+      feed_sup[i] = FEED_PACK(FEED_ERA, 0);
     } else if (op == OP_USE) {
-      feed_super[i] = FEED_PACK(FEED_USE, 0);
+      feed_sup[i] = FEED_PACK(FEED_USE, 0);
     } else if (op >= OP_MAT_BASE && op <= OP_MAT_MAX) {
-      feed_super[i] = FEED_PACK(FEED_MAT, op - OP_MAT_BASE);
+      feed_sup[i] = FEED_PACK(FEED_MAT, op - OP_MAT_BASE);
     }
   }
 
