@@ -55,6 +55,7 @@
 #include <stdarg.h>
 
 #define HEAP_SIZE   (1u << 14)
+#define HEAP_PAIRS  (HEAP_SIZE / 2)
 #define CODE_SIZE   (1u << 16)
 #define MAX_DEPTH   24
 #define MAX_BINDS   256
@@ -188,11 +189,15 @@ typedef struct {
 } Parser;
 
 #if LAMBIT_PTR_BITS == 16
-static uint32_t HEAP[HEAP_SIZE / 2] __attribute__((aligned(64)));
+static uint32_t HEAP[HEAP_PAIRS] __attribute__((aligned(64)));
 #else
 static Ptr HEAP[HEAP_SIZE] __attribute__((aligned(64)));
 #endif
-static uint16_t HP = 2; // bump cursor
+#if LAMBIT_PTR_BITS == 16
+static uint16_t HP = 1; // bump cursor in pair indices
+#else
+static uint16_t HP = 2; // bump cursor in cell indices
+#endif
 static uint16_t FREE_HEAD = 0;
 static Stats STATS;
 static const Code* PROG_CODE = NULL;
@@ -242,7 +247,7 @@ static inline bool is_tup(uint8_t op) {
 
 static inline Ptr heap_get_fst(uint16_t l) {
 #if LAMBIT_PTR_BITS == 16
-  return (Ptr)(HEAP[l >> 1] & 0xFFFFu);
+  return (Ptr)(HEAP[l] & 0xFFFFu);
 #else
   return HEAP[l + 0];
 #endif
@@ -250,15 +255,26 @@ static inline Ptr heap_get_fst(uint16_t l) {
 
 static inline Ptr heap_get_snd(uint16_t l) {
 #if LAMBIT_PTR_BITS == 16
-  return (Ptr)(HEAP[l >> 1] >> 16);
+  return (Ptr)(HEAP[l] >> 16);
 #else
   return HEAP[l + 1];
 #endif
 }
 
+static inline void heap_get_pair(uint16_t l, Ptr* fst, Ptr* snd) {
+#if LAMBIT_PTR_BITS == 16
+  uint32_t pair = HEAP[l];
+  *fst = (Ptr)(pair & 0xFFFFu);
+  *snd = (Ptr)(pair >> 16);
+#else
+  *fst = HEAP[l + 0];
+  *snd = HEAP[l + 1];
+#endif
+}
+
 static inline void heap_set_pair(uint16_t l, Ptr a, Ptr b) {
 #if LAMBIT_PTR_BITS == 16
-  HEAP[l >> 1] = ((uint32_t)b << 16) | (uint32_t)a;
+  HEAP[l] = ((uint32_t)b << 16) | (uint32_t)a;
 #else
   HEAP[l + 0] = a;
   HEAP[l + 1] = b;
@@ -268,7 +284,7 @@ static inline void heap_set_pair(uint16_t l, Ptr a, Ptr b) {
 static inline __attribute__((unused))
 bool heap_pair_is_zero(uint16_t l) {
 #if LAMBIT_PTR_BITS == 16
-  return HEAP[l >> 1] == 0;
+  return HEAP[l] == 0;
 #else
   return HEAP[l + 0] == 0 && HEAP[l + 1] == 0;
 #endif
@@ -276,7 +292,7 @@ bool heap_pair_is_zero(uint16_t l) {
 
 static inline uint16_t heap_get_free_next(uint16_t l) {
 #if LAMBIT_PTR_BITS == 16
-  return (uint16_t)(HEAP[l >> 1] & 0xFFFFu);
+  return (uint16_t)(HEAP[l] & 0xFFFFu);
 #else
   return (uint16_t)HEAP[l + 0];
 #endif
@@ -284,7 +300,7 @@ static inline uint16_t heap_get_free_next(uint16_t l) {
 
 static inline void heap_set_free_next(uint16_t l, uint16_t nxt) {
 #if LAMBIT_PTR_BITS == 16
-  HEAP[l >> 1] = (uint32_t)nxt;
+  HEAP[l] = (uint32_t)nxt;
 #else
   HEAP[l + 0] = nxt;
 #endif
@@ -311,8 +327,9 @@ static void gc_term(Ptr p) {
 #if !(LAMBIT_FREE_LIST && LAMBIT_TRUST_AFFINE)
   if (heap_pair_is_zero(l)) return;
 #endif
-  Ptr a = heap_get_fst(l);
-  Ptr b = heap_get_snd(l);
+  Ptr a;
+  Ptr b;
+  heap_get_pair(l, &a, &b);
   free2(l);
   gc_term(a);
   gc_term(b);
@@ -328,15 +345,35 @@ static uint16_t alloc2(void) {
 #endif
     return l;
   }
+  #if LAMBIT_PTR_BITS == 16
+  if (LIKELY(HP < HEAP_PAIRS)) {
+    uint16_t l = HP;
+    HP += 1;
+    return l;
+  }
+  #else
   if (LIKELY(HP < HEAP_SIZE - 1)) {
     uint16_t l = HP;
     HP += 2;
     return l;
   }
+  #endif
   die("Out of tuple memory (heap exhausted).");
   return 0;
 #else
   uint32_t tries = 0;
+  #if LAMBIT_PTR_BITS == 16
+  while (tries < HEAP_PAIRS) {
+    if (HP >= HEAP_PAIRS) HP = 1;
+    if (heap_pair_is_zero(HP)) {
+      uint16_t l = HP;
+      HP += 1;
+      return l;
+    }
+    HP += 1;
+    tries += 1;
+  }
+  #else
   while (tries < HEAP_SIZE) {
     if (HP >= HEAP_SIZE - 1) HP = 2;
     if (heap_pair_is_zero(HP)) {
@@ -347,6 +384,7 @@ static uint16_t alloc2(void) {
     HP += 2;
     tries += 2;
   }
+  #endif
   die("Out of tuple memory (heap exhausted).");
   return 0;
 #endif
@@ -597,7 +635,7 @@ static uint32_t compile_term(Code* out, const char* src) {
 static Ptr eval_term(const Code* c, uint32_t pc);
 
 // Feeds one term argument into a function starting at `pc`.
-static inline __attribute__((always_inline))
+static inline __attribute__((always_inline, hot))
 uint32_t feed_term(
   uint32_t pc,
   Ptr arg,
@@ -607,140 +645,107 @@ uint32_t feed_term(
   uint64_t* restrict app_get_p,
   uint64_t* restrict app_use_p
 ) {
-  uint8_t op = 0;
   uint32_t feed_sp = 0;
   uint32_t sub_sp = *sub_sp_p;
+  Ptr* restrict feed_stack = FEED_STACK;
+  Ptr* restrict sub_stack = SUB_STACK;
   const uint8_t* cc = PROG_CODE->buf;
   uint64_t app_lam = *app_lam_p;
   uint64_t app_mat = *app_mat_p;
   uint64_t app_get = *app_get_p;
   uint64_t app_use = *app_use_p;
 
-#if LAMBIT_COMPUTED_GOTO_FEED
-  static bool init = false;
-  static void* jump_tbl[256];
-  if (UNLIKELY(!init)) {
-    for (uint32_t i = 0; i < 256; ++i) jump_tbl[i] = &&L_BAD;
-    jump_tbl[OP_GET] = &&L_GET;
-    jump_tbl[OP_LAM] = &&L_LAM;
-    jump_tbl[OP_ERA] = &&L_ERA;
-    jump_tbl[OP_USE] = &&L_USE;
-    for (uint32_t i = OP_MAT; i <= 0x8F; ++i) jump_tbl[i] = &&L_MAT;
-    init = true;
-  }
+  for (;;) {
+    uint8_t op = cc[pc];
 
-#define FEED_DISPATCH() do { \
-    op = cc[pc]; \
-    goto *jump_tbl[op]; \
-  } while (0)
-#else
-#define FEED_DISPATCH() do { \
-    op = cc[pc]; \
-    goto L_SWITCH; \
-  } while (0)
-#endif
-
-#define FEED_POP_OR_RET() do { \
-    if (feed_sp == 0) { \
-      *sub_sp_p = sub_sp; \
-      *app_lam_p = app_lam; \
-      *app_mat_p = app_mat; \
-      *app_get_p = app_get; \
-      *app_use_p = app_use; \
-      return pc; \
-    } \
-    arg = FEED_STACK[--feed_sp]; \
-    FEED_DISPATCH(); \
-  } while (0)
-
-  FEED_DISPATCH();
-
-#if !LAMBIT_COMPUTED_GOTO_FEED
-L_SWITCH: {
-    if (op == OP_GET) goto L_GET;
-    if (is_mat(op)) goto L_MAT;
-    if (op == OP_LAM) goto L_LAM;
-    if (op == OP_ERA) goto L_ERA;
-    if (op == OP_USE) goto L_USE;
-    goto L_BAD;
-  }
-#endif
-
-L_GET: {
-    HOT_ASSERT(PTR_TAG(arg) == CTR_TUP, "Get expected tuple.");
-    HOT_ASSERT(feed_sp < MAX_FEED, "Feed stack overflow.");
+    if (LIKELY(op == OP_GET)) {
+      HOT_ASSERT(PTR_TAG(arg) == CTR_TUP, "Get expected tuple.");
+      HOT_ASSERT(feed_sp < MAX_FEED, "Feed stack overflow.");
 #if LAMBIT_COUNT_STATS
-    app_get++;
+      app_get++;
 #endif
-    uint16_t l = PTR_LOC(arg);
-    Ptr a = heap_get_fst(l);
-    Ptr b = heap_get_snd(l);
-    free2(l);
+      uint16_t l = PTR_LOC(arg);
+      Ptr a;
+      Ptr b;
+      heap_get_pair(l, &a, &b);
+      free2(l);
 
-    uint8_t nxt = cc[pc + 1];
-    if (is_mat(nxt)) {
+      uint8_t nxt = cc[pc + 1];
+      if (is_mat(nxt)) {
+#if LAMBIT_COUNT_STATS
+        app_mat++;
+#endif
+        uint32_t d = (uint32_t)(nxt - OP_MAT);
+        pc = (a == PTR_BT0) ? (pc + 2) : (pc + 2 + d);
+        arg = b;
+        continue;
+      }
+
+      feed_stack[feed_sp++] = b;
+      pc = pc + 1;
+      arg = a;
+      continue;
+    }
+
+    if (LIKELY(op == OP_LAM)) {
+#if LAMBIT_COUNT_STATS
+      app_lam++;
+#endif
+      HOT_ASSERT(sub_sp < MAX_SUB, "Substitution stack overflow.");
+      sub_stack[sub_sp++] = arg;
+      pc = pc + 1;
+      if (feed_sp == 0) break;
+      arg = feed_stack[--feed_sp];
+      continue;
+    }
+
+    if (LIKELY(op == OP_USE)) {
+      HOT_ASSERT(PTR_TAG(arg) == CTR_NUL, "Use expected ().");
+#if LAMBIT_COUNT_STATS
+      app_use++;
+#endif
+      pc = pc + 1;
+      if (feed_sp == 0) break;
+      arg = feed_stack[--feed_sp];
+      continue;
+    }
+
+    if (UNLIKELY(op == OP_ERA)) {
+#if LAMBIT_COUNT_STATS
+      app_lam++;
+#endif
+      HOT_ASSERT(sub_sp < MAX_SUB, "Substitution stack overflow.");
+      if (PTR_TAG(arg) == CTR_TUP) {
+        gc_term(arg);
+      }
+      sub_stack[sub_sp++] = PTR_NUL;
+      pc = pc + 1;
+      if (feed_sp == 0) break;
+      arg = feed_stack[--feed_sp];
+      continue;
+    }
+
+    if (UNLIKELY(is_mat(op))) {
+      HOT_ASSERT(PTR_TAG(arg) == CTR_BT0 || PTR_TAG(arg) == CTR_BT1, "Mat expected 0/1 bit.");
 #if LAMBIT_COUNT_STATS
       app_mat++;
 #endif
-      uint32_t d = (uint32_t)(nxt - OP_MAT);
-      pc = (a == PTR_BT0) ? (pc + 2) : (pc + 2 + d);
-      arg = b;
-      FEED_DISPATCH();
+      uint32_t d = (uint32_t)(op - OP_MAT);
+      pc = (arg == PTR_BT0) ? (pc + 1) : (pc + 1 + d);
+      if (feed_sp == 0) break;
+      arg = feed_stack[--feed_sp];
+      continue;
     }
 
-    FEED_STACK[feed_sp++] = b;
-    pc = pc + 1;
-    arg = a;
-    FEED_DISPATCH();
-  }
-
-L_LAM: {
-#if LAMBIT_COUNT_STATS
-    app_lam++;
-#endif
-    HOT_ASSERT(sub_sp < MAX_SUB, "Substitution stack overflow.");
-    SUB_STACK[sub_sp++] = arg;
-    pc = pc + 1;
-    FEED_POP_OR_RET();
-  }
-
-L_ERA: {
-#if LAMBIT_COUNT_STATS
-    app_lam++;
-#endif
-    HOT_ASSERT(sub_sp < MAX_SUB, "Substitution stack overflow.");
-    gc_term(arg);
-    SUB_STACK[sub_sp++] = PTR_NUL;
-    pc = pc + 1;
-    FEED_POP_OR_RET();
-  }
-
-L_USE: {
-    HOT_ASSERT(PTR_TAG(arg) == CTR_NUL, "Use expected ().");
-#if LAMBIT_COUNT_STATS
-    app_use++;
-#endif
-    pc = pc + 1;
-    FEED_POP_OR_RET();
-  }
-
-L_MAT: {
-    HOT_ASSERT(PTR_TAG(arg) == CTR_BT0 || PTR_TAG(arg) == CTR_BT1, "Mat expected 0/1 bit.");
-#if LAMBIT_COUNT_STATS
-    app_mat++;
-#endif
-    uint32_t d = (uint32_t)(op - OP_MAT);
-    pc = (arg == PTR_BT0) ? (pc + 1) : (pc + 1 + d);
-    FEED_POP_OR_RET();
-  }
-
-L_BAD: {
     die("Cannot apply non-function opcode 0x%02X at pc=%u.", op, pc);
   }
 
-#undef FEED_POP_OR_RET
-#undef FEED_DISPATCH
-  return 0;
+  *sub_sp_p = sub_sp;
+  *app_lam_p = app_lam;
+  *app_mat_p = app_mat;
+  *app_get_p = app_get;
+  *app_use_p = app_use;
+  return pc;
 }
 
 enum {
@@ -751,31 +756,32 @@ enum {
 };
 
 #if LAMBIT_PTR_BITS == 16
-#define CONT_MAKE(tag, code_id, saved_sp, payload) \
-  ((((uint32_t)(tag)      & 0x7Fu) << 25) | \
-   (((uint32_t)(code_id)  & 0x01u) << 24) | \
-   (((uint32_t)(saved_sp) & 0xFFu) << 16) | \
-   (((uint32_t)(payload)  & 0xFFFFu) << 0))
+#define CONT_MAKE(tag_v, code_id_v, saved_sp_v, payload_v) \
+  ((((uint32_t)(tag_v)) << 25) | \
+   (((uint32_t)(code_id_v)) << 24) | \
+   (((uint32_t)(saved_sp_v)) << 16) | \
+   ((uint32_t)(payload_v)))
 
-#define CONT_TAG(c)      ((uint8_t)(((c) >> 25) & 0x7Fu))
+#define CONT_TAG(c)      ((uint8_t)((c) >> 25))
 #define CONT_CODE_ID(c)  ((uint8_t)(((c) >> 24) & 0x01u))
-#define CONT_SAVED_SP(c) ((uint8_t)(((c) >> 16) & 0xFFu))
-#define CONT_PAYLOAD(c)  ((uint32_t)((c) & 0xFFFFu))
+#define CONT_SAVED_SP(c) ((uint8_t)((c) >> 16))
+#define CONT_PAYLOAD(c)  ((uint32_t)(uint16_t)(c))
 #else
-#define CONT_MAKE(tag, code_id, saved_sp, payload) \
-  ((((uint64_t)(tag)      & 0xFFull) << 48) | \
-   (((uint64_t)(code_id)  & 0xFFull) << 40) | \
-   (((uint64_t)(saved_sp) & 0xFFull) << 32) | \
-   (((uint64_t)(payload)  & 0xFFFFFFFFull) << 0))
+#define CONT_MAKE(tag_v, code_id_v, saved_sp_v, payload_v) \
+  ((((uint64_t)(tag_v)) << 48) | \
+   (((uint64_t)(code_id_v)) << 40) | \
+   (((uint64_t)(saved_sp_v)) << 32) | \
+   ((uint64_t)(payload_v)))
 
-#define CONT_TAG(c)      ((uint8_t)(((c) >> 48) & 0xFFull))
-#define CONT_CODE_ID(c)  ((uint8_t)(((c) >> 40) & 0xFFull))
-#define CONT_SAVED_SP(c) ((uint8_t)(((c) >> 32) & 0xFFull))
-#define CONT_PAYLOAD(c)  ((uint32_t)((c) & 0xFFFFFFFFull))
+#define CONT_TAG(c)      ((uint8_t)((c) >> 48))
+#define CONT_CODE_ID(c)  ((uint8_t)((c) >> 40))
+#define CONT_SAVED_SP(c) ((uint8_t)((c) >> 32))
+#define CONT_PAYLOAD(c)  ((uint32_t)(c))
 #endif
 
 // Evaluates a term to normal form.
-static Ptr eval_term(const Code* c, uint32_t start_pc) {
+static __attribute__((hot, flatten))
+Ptr eval_term(const Code* c, uint32_t start_pc) {
   enum {
     CODE_INPUT = 0,
     CODE_PROG  = 1,
@@ -787,15 +793,21 @@ static Ptr eval_term(const Code* c, uint32_t start_pc) {
   uint8_t code_id = CODE_INPUT;
   const uint8_t* cc = c->buf;
   uint32_t cont_sp = 0;
+  Cont* restrict cont_stack = EVAL_CONT_STACK;
+  Ptr* restrict sub_stack = SUB_STACK;
   uint32_t sub_sp = SUB_SP;
   uint64_t app_fun = STATS.app_fun;
   uint64_t app_lam = STATS.app_lam;
   uint64_t app_mat = STATS.app_mat;
   uint64_t app_get = STATS.app_get;
   uint64_t app_use = STATS.app_use;
+  const bool top_get = PROG_TOP_GET;
+  const bool top_get_mat = PROG_TOP_GET_MAT;
+  const uint32_t top_pc = PROG_PC;
+  const uint32_t top_mat_delta = PROG_TOP_MAT_DELTA;
 #define CONT_PUSH(tag, cid, ssp, pay) do { \
     HOT_ASSERT(cont_sp < MAX_EVAL, "Eval continuation stack overflow."); \
-    EVAL_CONT_STACK[cont_sp++] = CONT_MAKE((tag), (cid), (ssp), (pay)); \
+    cont_stack[cont_sp++] = CONT_MAKE((tag), (cid), (ssp), (pay)); \
   } while (0)
 
 L_EVAL: {
@@ -809,10 +821,10 @@ L_EVAL: {
       app_fun++;
 #endif
       if (cont_sp > 0) {
-        Cont c0 = EVAL_CONT_STACK[cont_sp - 1];
+        Cont c0 = cont_stack[cont_sp - 1];
         if (CONT_TAG(c0) == CONT_REC_DONE) {
           uint32_t saved_sp = CONT_SAVED_SP(c0);
-          EVAL_CONT_STACK[cont_sp - 1] = CONT_MAKE(CONT_REC_FEED, 0, saved_sp, 0);
+          cont_stack[cont_sp - 1] = CONT_MAKE(CONT_REC_FEED, 0, saved_sp, 0);
           pc = pc + 1;
           goto L_EVAL;
         }
@@ -839,26 +851,26 @@ L_EVAL: {
 L_VAR: {
     uint8_t idx = (uint8_t)(op - OP_VAR);
     HOT_ASSERT(idx < sub_sp, "Variable out of scope: idx=%u sub_sp=%u", idx, sub_sp);
-    val = SUB_STACK[sub_sp - 1 - idx];
+    val = sub_stack[sub_sp - 1 - idx];
     goto L_RET;
   }
 
 L_TUP: {
     uint32_t d = (uint32_t)(op - OP_TUP);
-    if (d == 1) {
+    if (LIKELY(d == 1)) {
       uint8_t fst_op = cc[pc + 1];
       Ptr fst_val = PTR_NUL;
 
-      if (fst_op == OP_NUL) {
-        fst_val = PTR_NUL;
+      if (LIKELY(fst_op == OP_BT1)) {
+        fst_val = PTR_BT1;
       } else if (fst_op == OP_BT0) {
         fst_val = PTR_BT0;
-      } else if (fst_op == OP_BT1) {
-        fst_val = PTR_BT1;
       } else if (is_var(fst_op)) {
         uint8_t idx = (uint8_t)(fst_op - OP_VAR);
         HOT_ASSERT(idx < sub_sp, "Variable out of scope: idx=%u sub_sp=%u", idx, sub_sp);
-        fst_val = SUB_STACK[sub_sp - 1 - idx];
+        fst_val = sub_stack[sub_sp - 1 - idx];
+      } else if (fst_op == OP_NUL) {
+        fst_val = PTR_NUL;
       } else {
         goto L_TUP_SLOW;
       }
@@ -876,37 +888,68 @@ L_TUP_SLOW:
 
 L_RET: {
     if (cont_sp == 0) goto L_DONE;
-    Cont c0 = EVAL_CONT_STACK[cont_sp - 1];
+    Cont c0 = cont_stack[cont_sp - 1];
     uint8_t tag = CONT_TAG(c0);
 
     if (LIKELY(tag == CONT_TUP_DONE)) {
-      for (;;) {
-        sub_sp = CONT_SAVED_SP(c0);
+      if (LIKELY(top_get_mat)) {
+        for (;;) {
+          if (LIKELY(cont_sp >= 2)) {
+            Cont c1 = cont_stack[cont_sp - 2];
+            uint8_t t1 = CONT_TAG(c1);
+            if (LIKELY(t1 == CONT_TUP_DONE)) {
+              val = mk_tup((Ptr)CONT_PAYLOAD(c0), val);
+              cont_sp = cont_sp - 1;
+              c0 = c1;
+              continue;
+            }
+            if (t1 == CONT_REC_FEED) {
+              uint32_t saved_sp = CONT_SAVED_SP(c1);
+              sub_sp = 0;
+#if LAMBIT_COUNT_STATS
+              app_get++;
+              app_mat++;
+#endif
+              Ptr fst = (Ptr)CONT_PAYLOAD(c0);
+              uint32_t body_pc = (fst == PTR_BT0)
+                ? (top_pc + 2)
+                : (top_pc + 2 + top_mat_delta);
+              body_pc = feed_term(
+                body_pc, val, &sub_sp, &app_lam, &app_mat, &app_get, &app_use
+              );
+              cont_stack[cont_sp - 2] = CONT_MAKE(CONT_REC_DONE, 0, saved_sp, 0);
+              cont_sp = cont_sp - 1;
+              code_id = CODE_PROG;
+              cc = PROG_CODE->buf;
+              pc = body_pc;
+              goto L_EVAL;
+            }
+          }
 
-        if (PROG_TOP_GET && cont_sp >= 2) {
-          Cont c1 = EVAL_CONT_STACK[cont_sp - 2];
+          sub_sp = CONT_SAVED_SP(c0);
+          val = mk_tup((Ptr)CONT_PAYLOAD(c0), val);
+          cont_sp = cont_sp - 1;
+          if (cont_sp == 0) goto L_DONE;
+          goto L_RET;
+        }
+      }
+
+      for (;;) {
+        if (top_get && cont_sp >= 2) {
+          Cont c1 = cont_stack[cont_sp - 2];
           if (CONT_TAG(c1) == CONT_REC_FEED) {
             uint32_t saved_sp = CONT_SAVED_SP(c1);
             sub_sp = 0;
 #if LAMBIT_COUNT_STATS
             app_get++;
 #endif
-            uint32_t body_pc = PROG_PC + 1;
-            if (PROG_TOP_GET_MAT) {
-#if LAMBIT_COUNT_STATS
-              app_mat++;
-#endif
-              Ptr fst = (Ptr)CONT_PAYLOAD(c0);
-              body_pc = (fst == PTR_BT0) ? (PROG_PC + 2) : (PROG_PC + 2 + PROG_TOP_MAT_DELTA);
-            } else {
-              body_pc = feed_term(
-                body_pc, (Ptr)CONT_PAYLOAD(c0), &sub_sp, &app_lam, &app_mat, &app_get, &app_use
-              );
-            }
+            uint32_t body_pc = feed_term(
+              top_pc + 1, (Ptr)CONT_PAYLOAD(c0), &sub_sp, &app_lam, &app_mat, &app_get, &app_use
+            );
             body_pc = feed_term(
               body_pc, val, &sub_sp, &app_lam, &app_mat, &app_get, &app_use
             );
-            EVAL_CONT_STACK[cont_sp - 2] = CONT_MAKE(CONT_REC_DONE, 0, saved_sp, 0);
+            cont_stack[cont_sp - 2] = CONT_MAKE(CONT_REC_DONE, 0, saved_sp, 0);
             cont_sp = cont_sp - 1;
             code_id = CODE_PROG;
             cc = PROG_CODE->buf;
@@ -915,10 +958,11 @@ L_RET: {
           }
         }
 
+        sub_sp = CONT_SAVED_SP(c0);
         val = mk_tup((Ptr)CONT_PAYLOAD(c0), val);
         cont_sp = cont_sp - 1;
         if (cont_sp == 0) goto L_DONE;
-        c0 = EVAL_CONT_STACK[cont_sp - 1];
+        c0 = cont_stack[cont_sp - 1];
         if (CONT_TAG(c0) != CONT_TUP_DONE) break;
       }
       goto L_RET;
@@ -926,7 +970,7 @@ L_RET: {
 
     if (tag == CONT_TUP_SND) {
       sub_sp = CONT_SAVED_SP(c0);
-      EVAL_CONT_STACK[cont_sp - 1] = CONT_MAKE(CONT_TUP_DONE, 0, sub_sp, val);
+      cont_stack[cont_sp - 1] = CONT_MAKE(CONT_TUP_DONE, 0, sub_sp, val);
       code_id = CONT_CODE_ID(c0);
       cc = (code_id == CODE_PROG) ? PROG_CODE->buf : c->buf;
       pc = CONT_PAYLOAD(c0);
@@ -936,37 +980,39 @@ L_RET: {
     if (tag == CONT_REC_FEED) {
       uint32_t saved_sp = CONT_SAVED_SP(c0);
       sub_sp = 0;
-      EVAL_CONT_STACK[cont_sp - 1] = CONT_MAKE(CONT_REC_DONE, 0, saved_sp, 0);
+      cont_stack[cont_sp - 1] = CONT_MAKE(CONT_REC_DONE, 0, saved_sp, 0);
       code_id = CODE_PROG;
       cc = PROG_CODE->buf;
 
-      if (PROG_TOP_GET_MAT) {
+      if (top_get_mat) {
         HOT_ASSERT(PTR_TAG(val) == CTR_TUP, "Get expected tuple.");
 #if LAMBIT_COUNT_STATS
         app_get++;
 #endif
         uint16_t l = PTR_LOC(val);
-        Ptr a = heap_get_fst(l);
-        Ptr b = heap_get_snd(l);
+        Ptr a;
+        Ptr b;
+        heap_get_pair(l, &a, &b);
         free2(l);
 #if LAMBIT_COUNT_STATS
         app_mat++;
 #endif
-        uint32_t nxt_pc = (a == PTR_BT0) ? (PROG_PC + 2) : (PROG_PC + 2 + PROG_TOP_MAT_DELTA);
+        uint32_t nxt_pc = (a == PTR_BT0) ? (top_pc + 2) : (top_pc + 2 + top_mat_delta);
         pc = feed_term(nxt_pc, b, &sub_sp, &app_lam, &app_mat, &app_get, &app_use);
-      } else if (PROG_TOP_GET) {
+      } else if (top_get) {
         HOT_ASSERT(PTR_TAG(val) == CTR_TUP, "Get expected tuple.");
 #if LAMBIT_COUNT_STATS
         app_get++;
 #endif
         uint16_t l = PTR_LOC(val);
-        Ptr a = heap_get_fst(l);
-        Ptr b = heap_get_snd(l);
+        Ptr a;
+        Ptr b;
+        heap_get_pair(l, &a, &b);
         free2(l);
-        pc = feed_term(PROG_PC + 1, a, &sub_sp, &app_lam, &app_mat, &app_get, &app_use);
+        pc = feed_term(top_pc + 1, a, &sub_sp, &app_lam, &app_mat, &app_get, &app_use);
         pc = feed_term(pc, b, &sub_sp, &app_lam, &app_mat, &app_get, &app_use);
       } else {
-        pc = feed_term(PROG_PC, val, &sub_sp, &app_lam, &app_mat, &app_get, &app_use);
+        pc = feed_term(top_pc, val, &sub_sp, &app_lam, &app_mat, &app_get, &app_use);
       }
       goto L_EVAL;
     }
